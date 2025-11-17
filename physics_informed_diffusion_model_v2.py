@@ -13,6 +13,9 @@ from matplotlib.gridspec import GridSpec
 import imageio
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.cm as cm
+import matplotlib.colors as colors
+
+
 
 print("=" * 70)
 print("PHYSICS-INFORMED GENERATIVE MODEL (PIGM) - FULL DIAGNOSTIC")
@@ -397,6 +400,87 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # ============================================================================
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
+
+
+def visualize_vortex_and_error_landscape(model):
+    """
+    The definitive combined visualization. This shows the vortex itself (as color)
+    on top of the 3D landscape of its physical error (as height).
+    """
+    print("="*70)
+    print("DIAGNOSTIC: The Vortex & Error Landscape Map")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate the samples ---
+    print("Generating samples to map...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        physics_sample = model.sample(1, apply_physics=True)[0]
+
+    # --- Step 2: Compute Error (for height) and Vorticity (for color) ---
+    # Error (Z-axis): Absolute divergence
+    error_v = compute_divergence(vanilla_sample[0:1], vanilla_sample[1:2]).abs()[0].cpu().numpy()
+    error_p = compute_divergence(physics_sample[0:1], physics_sample[1:2]).abs()[0].cpu().numpy()
+
+    # Vortex (Color): Vorticity (curl)
+    vort_v = compute_curl(vanilla_sample[0:1], vanilla_sample[1:2])[0].cpu().numpy()
+    vort_p = compute_curl(physics_sample[0:1], physics_sample[1:2])[0].cpu().numpy()
+    print("✓ Computed physical error (for height) and vorticity (for color).")
+
+    # --- Step 3: Set up the 3D plot ---
+    fig = plt.figure(figsize=(18, 9))
+    
+    H, W = error_v.shape
+    X, Y = np.meshgrid(np.arange(W), np.arange(H))
+
+    # --- HONEST SCALING for a fair comparison ---
+    # Height scale is based on the max error of the vanilla model
+    max_error = error_v.max()
+    # Color scale is based on the max vorticity across both models
+    max_vort = max(np.abs(vort_v).max(), np.abs(vort_p).max())
+    norm = colors.Normalize(vmin=-max_vort, vmax=max_vort)
+    cmap = cm.RdBu_r # Red/Blue for clockwise/counter-clockwise rotation
+    
+    # --- Plot the Vanilla Landscape ---
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    # Map vorticity values to colors
+    facecolors_v = cmap(norm(vort_v))
+    ax1.plot_surface(X, Y, error_v, facecolors=facecolors_v, linewidth=0, antialiased=False, shade=False)
+    ax1.set_title("Vanilla Model", fontsize=16, fontweight='bold', pad=20)
+    ax1.set_zlim(0, max_error)
+    ax1.set_xlabel("X coordinate")
+    ax1.set_ylabel("Y coordinate")
+    ax1.set_zlabel("Physical Error (Height)")
+
+    # --- Plot the Physics-Informed Landscape ---
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    # Map vorticity values to colors
+    facecolors_p = cmap(norm(vort_p))
+    ax2.plot_surface(X, Y, error_p, facecolors=facecolors_p, linewidth=0, antialiased=False, shade=False)
+    ax2.set_title("Physics-Informed Model", fontsize=16, fontweight='bold', pad=20)
+    ax2.set_zlim(0, max_error)
+    ax2.set_xlabel("X coordinate")
+    ax2.set_ylabel("Y coordinate")
+    ax2.set_zlabel("Physical Error (Height)")
+
+    # Add a shared color bar for vorticity
+    mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+    cbar = fig.colorbar(mappable, ax=[ax1, ax2], shrink=0.6, pad=0.1, location='bottom')
+    cbar.set_label("Vorticity (Rotation Speed & Direction)", fontsize=12)
+
+    plt.suptitle("Comparing the Vortex (Color) on its Error Landscape (Height)", fontsize=20, fontweight='bold')
+    plt.savefig('diagnostic_vortex_and_error_landscape.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # --- Print quantitative results for confirmation ---
+    mean_error_v = error_v.mean()
+    mean_error_p = error_p.mean()
+    print("\n--- Quantitative Summary ---")
+    print(f"Vanilla Mean Error (Average Mountain Height):   {mean_error_v:.6f}")
+    print(f"Physics Mean Error (Average Plain Height):      {mean_error_p:.6f}")
+    print(f"Improvement Factor:                             {mean_error_v / (mean_error_p + 1e-9):.1f}x")
 
 def visualize_error_landscape(model):
     """
