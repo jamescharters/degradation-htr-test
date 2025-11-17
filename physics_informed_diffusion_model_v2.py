@@ -1139,6 +1139,9 @@ if __name__ == "__main__":
     print("Running the Landscape Visualization...")
     visualize_error_landscape(model)
 
+    print("Running the Landscape Visualization and Vortex...")
+    visualize_vortex_and_error_landscape(model)
+
     # Summary
     print("\n" + "="*70)
     print("DIAGNOSTIC SUMMARY")
