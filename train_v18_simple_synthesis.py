@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Quill PINN V18 (SIMPLE SYNTHESIS)
+Quill PINN V18 (FINAL & CORRECTED)
 This script represents the simplest, most robust synthesis of all our insights.
-It uses a single, unified network and a simple two-phase training schedule:
-1. Boundary Warm-up: Give the network a head start on learning the final shape.
-2. Full Physics: Train the boundary and the proven, sheath-constrained physics
-   simultaneously to learn the stroke process.
+It uses a single, unified network and a two-phase training schedule with an
+optimizer reset to ensure stable convergence. It also fixes all previous bugs.
 """
 
 import torch
@@ -18,7 +16,7 @@ from pathlib import Path
 import sys
 
 print("=" * 60)
-print("QUILL PHYSICS PINN TRAINING V18 (SIMPLE SYNTHESIS)")
+print("QUILL PHYSICS PINN TRAINING V18 (FINAL & CORRECTED)")
 print("=" * 60)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -27,12 +25,10 @@ print(f"✓ Using device: {device}\n")
 # ============================================
 # MODEL & GRADIENT UTILS
 # ============================================
-# Using the positional encoding model that we proved works for learning shapes
 class QuillPINN_V18(nn.Module):
     def __init__(self, encoding_dim=10):
         super().__init__()
         self.encoding_dim = encoding_dim
-        # Input: 3 coords (x,y,t) * 2 (sin,cos) * encoding_dim
         input_dim = 3 * 2 * encoding_dim
         self.network = nn.Sequential(
             nn.Linear(input_dim, 128), nn.ReLU(),
@@ -55,7 +51,7 @@ class QuillPINN_V18(nn.Module):
 def compute_gradient(o, i): return torch.autograd.grad(o, i, grad_outputs=torch.ones_like(o), create_graph=True, retain_graph=True, allow_unused=True)[0]
 
 # ============================================
-# DATASET (with all necessary sampling methods)
+# DATASET
 # ============================================
 class QuillDataset_V18:
     def __init__(self, prefix, metadata_path):
@@ -73,13 +69,12 @@ class QuillDataset_V18:
                 if stroke['start_time'] <= t_sim < stroke['end_time']: active_stroke = stroke; break
             if active_stroke:
                 progress = (t_sim - active_stroke['start_time']) / (active_stroke['end_time'] - active_stroke['start_time'])
-                points = np.array(active_stroke['points']); n_pts = len(points)
-                idx_f = progress*(n_pts-1); idx0, idx1 = int(np.floor(idx_f)), int(np.ceil(idx_f))
-                if idx0>=n_pts: idx0=n_pts-1
-                if idx1>=n_pts: idx1=n_pts-1
-                if idx0==idx1: pos = points[idx0]
-                else: pos = points[idx0]*(1-(idx_f-idx0)) + points[idx1]*(idx_f-idx0)
-                positions.append((pos[0]/self.width, pos[1]/self.height))
+                points = np.array(active_stroke['points'])
+                idx_f = progress * (len(points) - 1); idx0, idx1 = int(np.floor(idx_f)), int(np.ceil(idx_f))
+                if idx1 >= len(points): idx1 = idx0 = len(points) - 1
+                if idx0 == idx1: current_pos = points[idx0]
+                else: current_pos = points[idx0] * (1 - (idx_f - idx0)) + points[idx1] * (idx_f - idx0)
+                positions.append((current_pos[0]/self.width, current_pos[1]/self.height))
             else: positions.append((np.nan, np.nan))
         return torch.tensor(positions, dtype=torch.float32, device=t_values.device)
     def get_initial_points(self, n): return torch.rand(n, 2, device=device)
@@ -119,7 +114,9 @@ def train_pinn_v18(model, dataset, epochs=25000, warmup_epochs=5000):
     for epoch in range(warmup_epochs):
         model.train(); optimizer.zero_grad()
         n_data = 2048
-        x_ic, y_ic = dataset.get_initial_points(n_data).T
+        # Correctly unpack points
+        ic_pts = dataset.get_initial_points(n_data)
+        x_ic, y_ic = ic_pts[:, 0], ic_pts[:, 1]
         loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
         x_fc, y_fc, h_fc = dataset.get_final_points(n_data)
         h_pred_fc = model(x_fc, y_fc, torch.ones_like(x_fc))
@@ -134,15 +131,14 @@ def train_pinn_v18(model, dataset, epochs=25000, warmup_epochs=5000):
     for epoch in range(warmup_epochs, epochs):
         model.train(); optimizer.zero_grad()
         
-        # Boundary loss (always on)
         n_data = 1024
-        x_ic, y_ic = dataset.get_initial_points(n_data).T
+        ic_pts = dataset.get_initial_points(n_data)
+        x_ic, y_ic = ic_pts[:, 0], ic_pts[:, 1]
         loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
         x_fc, y_fc, h_fc = dataset.get_final_points(n_data)
         h_pred_fc = model(x_fc, y_fc, torch.ones_like(x_fc)); loss_fc = ((h_pred_fc - h_fc) ** 2).mean()
         loss_boundary = loss_ic + loss_fc
 
-        # Full physics with sheath constraint
         n_phys = 1500
         x_src, y_src, t_src = dataset.get_on_path_points(n_phys); x_src.requires_grad_(); y_src.requires_grad_(); t_src.requires_grad_()
         h_src = model(x_src, y_src, t_src); h_t_src = compute_gradient(h_src, t_src)
@@ -152,7 +148,10 @@ def train_pinn_v18(model, dataset, epochs=25000, warmup_epochs=5000):
         h_sh = model(x_sh, y_sh, t_sh); h_t_sh = compute_gradient(h_sh, t_sh)
         loss_sheath = (h_t_sh**2).mean()
 
-        x_q, y_q, t_q = dataset.get_off_path_points(n_phys).T; x_q.requires_grad_(); y_q.requires_grad_(); t_q.requires_grad_()
+        # Correctly unpack points
+        off_path_pts = dataset.get_off_path_points(n_phys)
+        x_q, y_q, t_q = off_path_pts[:, 0], off_path_pts[:, 1], off_path_pts[:, 2]
+        x_q.requires_grad_(); y_q.requires_grad_(); t_q.requires_grad_()
         h_q = model(x_q, y_q, t_q); h_t_q = compute_gradient(h_q, t_q)
         loss_quiescence = (h_t_q**2).mean()
         
@@ -174,12 +173,11 @@ def visualize_reconstruction_v18(model, dataset, output_path='reconstruction_v18
     fig, axes = plt.subplots(1, len(time_points), figsize=(16, 3))
     print("\nGenerating visualization...")
     with torch.no_grad():
-        x_grid, y_grid = torch.linspace(0,1,dataset.width,device=device), torch.linspace(0,1,dataset.height,device=device)
-        X, Y = torch.meshgrid(x_grid, y_grid, indexing='xy')
-        x_flat, y_flat = X.flatten(), Y.flatten()
         for i, t_val in enumerate(time_points):
-            t_tensor = torch.full_like(x_flat, t_val)
-            h_pred = model(x_flat, y_flat, t_tensor).cpu().numpy().reshape(dataset.height, dataset.width)
+            x_grid = torch.linspace(0,1,dataset.width,device=device); y_grid = torch.linspace(0,1,dataset.height,device=device)
+            X, Y = torch.meshgrid(x_grid, y_grid, indexing='xy')
+            x_flat, y_flat, t_flat = X.flatten(), Y.flatten(), torch.full_like(X.flatten(), t_val)
+            h_pred = model(x_flat, y_flat, t_flat).cpu().numpy().reshape(dataset.height, dataset.width)
             axes[i].imshow(1.0 - h_pred, cmap='gray', vmin=0, vmax=1)
             axes[i].set_title(f't={t_val:.2f}'); axes[i].axis('off')
     plt.tight_layout(); plt.savefig(output_path, dpi=200); plt.show()
@@ -188,8 +186,12 @@ def visualize_reconstruction_v18(model, dataset, output_path='reconstruction_v18
 if __name__ == "__main__":
     prefix = "synthetic_letters/CANONE_letter_0_C"
     meta_path = f"{prefix}_metadata.json"
+    
+    # MANDATORY ACTION: Regenerate data with the new simulator
+    print("Please ensure you have run the CORRECTED quill_simulator.py first.")
     if not Path(f"{prefix}.png").exists() or not Path(meta_path).exists():
-        print("✗ Data not found! Please run the CORRECTED quill_simulator.py first."); sys.exit(1)
+        print("✗ Data not found!"); sys.exit(1)
+        
     dataset = QuillDataset_V18(prefix, meta_path)
     model = QuillPINN_V18().to(device)
     train_pinn_v18(model, dataset)
