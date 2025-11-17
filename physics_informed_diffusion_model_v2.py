@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+import imageio
 
 print("=" * 70)
 print("PHYSICS-INFORMED GENERATIVE MODEL (PIGM) - FULL DIAGNOSTIC")
@@ -400,6 +401,100 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
 
+def visualize_ink_drop_advection(model):
+    """
+    The most intuitive visualization: simulating an ink drop in the flow.
+    This clearly shows the effect of non-physical sources and sinks.
+    """
+    print("="*70)
+    print("DIAGNOSTIC ULTIMATE: Intuitive Ink Drop Simulation")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate ONE flow field and create a "fixed" version ---
+    # This provides a perfect A/B comparison on the exact same base flow.
+    print("Generating a single base flow field...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        vx_v, vy_v = vanilla_sample[0:1], vanilla_sample[1:2]
+        
+        # Create a physically corrected version of the SAME flow field
+        vx_p, vy_p, _, _ = project_to_divergence_free_fft(vx_v, vy_v)
+
+    # --- Step 2: Set up the simulation ---
+    print("Setting up ink drop simulation...")
+    num_steps = 100
+    dt = 0.1  # Timestep for advection
+    H, W = model.img_size, model.img_size
+    
+    # Create initial ink drop (a soft Gaussian circle in the center)
+    y, x = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij')
+    ink_initial = torch.exp(-((x**2 + y**2) * 15.0)).to(device).unsqueeze(0).unsqueeze(0)
+    
+    ink_vanilla = ink_initial.clone()
+    ink_physics = ink_initial.clone()
+    
+    # Normalize velocity fields for grid_sample
+    # grid_sample expects displacement in [-1, 1] range
+    # A velocity of 1 unit/sec moves 1/W of the width per sec
+    # Over num_steps, total displacement is v * dt * num_steps
+    # We scale it down to make the animation look good
+    scale_factor = 2.0 
+    vx_v_norm = vx_v * dt * scale_factor / W
+    vy_v_norm = vy_v * dt * scale_factor / H
+    vx_p_norm = vx_p * dt * scale_factor / W
+    vy_p_norm = vy_p * dt * scale_factor / H
+
+    # --- Step 3: Run the simulation and store frames ---
+    print("Running simulation and capturing frames...")
+    frames = []
+    for step in range(num_steps):
+        # Create the sampling grid for advection (backward lookup)
+        base_grid = torch.stack([x, y], dim=2).to(device).unsqueeze(0)
+        
+        # Advect vanilla ink
+        grid_v = base_grid - torch.stack([vx_v_norm[0], vy_v_norm[0]], dim=-1)
+        ink_vanilla = F.grid_sample(ink_vanilla, grid_v, mode='bilinear', padding_mode='border', align_corners=False)
+
+        # Advect physics ink
+        grid_p = base_grid - torch.stack([vx_p_norm[0], vy_p_norm[0]], dim=-1)
+        ink_physics = F.grid_sample(ink_physics, grid_p, mode='bilinear', padding_mode='border', align_corners=False)
+
+        # --- Create a frame for the GIF every few steps ---
+        if step % 2 == 0:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            
+            # Total ink amount calculation (conservation check)
+            total_ink_v = ink_vanilla.sum().item()
+            total_ink_p = ink_physics.sum().item()
+            
+            axes[0].imshow(ink_vanilla[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
+            axes[0].set_title(f"Vanilla Flow\nTotal Ink: {total_ink_v:.2f}", fontsize=12)
+            axes[0].axis('off')
+
+            axes[1].imshow(ink_physics[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
+            axes[1].set_title(f"Physics-Informed Flow\nTotal Ink: {total_ink_p:.2f}", fontsize=12)
+            axes[1].axis('off')
+            
+            plt.suptitle(f"Ink Drop Simulation | Step: {step+1}/{num_steps}", fontsize=14, fontweight='bold')
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            
+            # Convert plot to image array
+            fig.canvas.draw()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            frames.append(frame)
+            plt.close(fig)
+            
+            if (step+2) % 20 == 0:
+                print(f"  ... captured frame {step//2 + 1} / {num_steps//2}")
+
+    # --- Step 4: Save the GIF ---
+    print("Saving animation to diagnostic_ink_drop.gif...")
+    imageio.mimsave('diagnostic_ink_drop.gif', frames, fps=15)
+    print("✓ Done!")
+
 def visualize_flow_fields(model):
     """
     Provides an intuitive visualization using stream plots to show the actual
@@ -781,9 +876,12 @@ if __name__ == "__main__":
     print("Running Final Comparison...")
     final_comparison(model, n_samples=4)
     
-    # 5. NEW INTUITIVE VISUALIZATION
+    # 5. NEW INTUITIVE VISUALIZATIONS
     print("Running Intuitive Flow Visualization...")
     visualize_flow_fields(model)
+
+    print("Running Intuitive Ink Drop Visualization...")
+    visualize_ink_drop_advection(model)
 
     # Summary
     print("\n" + "="*70)
