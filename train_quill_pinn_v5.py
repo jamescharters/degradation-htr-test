@@ -42,11 +42,9 @@ class QuillPINN_V5(nn.Module):
         return torch.cat([torch.sin(2*np.pi*t_expanded), torch.cos(2*np.pi*t_expanded)], dim=-1)
 
     def forward(self, x, y, t):
-        # Handle single value inputs during visualization for convenience
         if x.dim() == 0: x = x.unsqueeze(0)
         if y.dim() == 0: y = y.unsqueeze(0)
         if t.dim() == 0: t = t.unsqueeze(0)
-        
         t_encoded = self.encode_time(t)
         inputs = torch.cat([x.unsqueeze(-1), y.unsqueeze(-1), t_encoded], dim=-1)
         return torch.relu(self.network(inputs).squeeze(-1))
@@ -60,30 +58,22 @@ def compute_gradient(output, input_tensor):
     return grad
 
 # ============================================
-# DATASET (with corrected path interpolation)
+# DATASET
 # ============================================
 class QuillDataset_V5:
     def __init__(self, prefix, metadata_path):
         self.image_final = np.array(Image.open(f"{prefix}.png").convert('L')).astype(np.float32) / 255.0
         self.image_final = 1.0 - self.image_final
-        
         self.height, self.width = self.image_final.shape
-        
         with open(metadata_path, 'r') as f:
             self.metadata = json.load(f)
         self.total_time = self.metadata['total_time']
-        
         print(f"✓ Loaded final frame ({self.width}x{self.height}) and metadata.")
         print(f"  Total simulation time: {self.total_time:.2f}s")
 
     def get_quill_position_at_time(self, t_values):
-        # --- CORRECTED FUNCTION ---
-        # We .detach() the tensor because this numpy-based lookup is not part of the
-        # gradient computation. The original tensor remains on the computation graph.
         t_values_np = t_values.detach().cpu().numpy()
-        
         positions = []
-        
         for t_norm in t_values_np:
             t_sim = t_norm * self.total_time
             active_stroke = None
@@ -91,38 +81,28 @@ class QuillDataset_V5:
                 if stroke['start_time'] <= t_sim < stroke['end_time']:
                     active_stroke = stroke
                     break
-            
             if active_stroke:
                 progress = (t_sim - active_stroke['start_time']) / (active_stroke['end_time'] - active_stroke['start_time'])
                 points_arr = np.array(active_stroke['points'])
                 idx_float = progress * (len(points_arr) - 1)
-                idx0 = int(np.floor(idx_float))
-                idx1 = int(np.ceil(idx_float))
-
-                # Robustness check to prevent index out of bounds
+                idx0, idx1 = int(np.floor(idx_float)), int(np.ceil(idx_float))
                 if idx0 >= len(points_arr): idx0 = len(points_arr) - 1
                 if idx1 >= len(points_arr): idx1 = len(points_arr) - 1
-
-                if idx0 == idx1:
-                    pos = points_arr[idx0]
-                else:
-                    local_progress = idx_float - idx0
-                    pos = points_arr[idx0] * (1 - local_progress) + points_arr[idx1] * local_progress
-                
+                if idx0 == idx1: pos = points_arr[idx0]
+                else: pos = points_arr[idx0] * (1 - (idx_float - idx0)) + points_arr[idx1] * (idx_float - idx0)
                 positions.append((pos[0] / self.width, pos[1] / self.height))
             else:
-                positions.append((np.nan, np.nan)) # Quill is off the page
-                
+                positions.append((np.nan, np.nan))
         return torch.tensor(positions, dtype=torch.float32, device=t_values.device)
 
-    def get_initial_points(self, n_points): return np.random.rand(n_points, 2)
-    def get_final_points(self, n_points):
-        x_idx, y_idx = np.random.randint(0, self.width, n_points), np.random.randint(0, self.height, n_points)
+    def get_initial_points(self, n): return np.random.rand(n, 2)
+    def get_final_points(self, n):
+        x_idx, y_idx = np.random.randint(0, self.width, n), np.random.randint(0, self.height, n)
         return x_idx / (self.width-1), y_idx / (self.height-1), self.image_final[y_idx, x_idx]
-    def get_physics_points(self, n_points): return np.random.rand(n_points, 3)
+    def get_physics_points(self, n): return np.random.rand(n, 3)
 
 # ============================================
-# THE "SOURCE TERM" PHYSICS LOSS
+# THE "SOURCE TERM" PHYSICS LOSS (CORRECTED)
 # ============================================
 def physics_loss_v5_sourceterm(model, dataset, x, y, t):
     x.requires_grad_(True); y.requires_grad_(True); t.requires_grad_(True)
@@ -132,18 +112,23 @@ def physics_loss_v5_sourceterm(model, dataset, x, y, t):
     if h_t is None: return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
     quill_pos = dataset.get_quill_position_at_time(t)
-    quill_x, quill_y = quill_pos[:, 0].unsqueeze(1), quill_pos[:, 1].unsqueeze(1)
     
+    # --- THE FIX IS HERE ---
+    # Keep all tensors 1D for consistent indexing.
+    # We remove the .unsqueeze(1) calls.
+    quill_x, quill_y = quill_pos[:, 0], quill_pos[:, 1]
+    
+    # All tensors are now [batch_size], so this is a valid element-wise operation.
     dist_sq = (x - quill_x)**2 + (y - quill_y)**2
     tip_radius_sq = (5.0 / dataset.width)**2
+    
+    # The mask is now also 1D, which matches h_t's shape.
     is_under_tip = (dist_sq < tip_radius_sq) & (~torch.isnan(dist_sq))
     
-    # Rule 1: Source Loss - Where the quill IS, h_t must be positive.
     target_ink_rate = 2.0
     ink_rate_under_tip = h_t[is_under_tip]
     loss_source = (torch.relu(target_ink_rate - ink_rate_under_tip)**2).mean()
     
-    # Rule 2: Quiescence Loss - Where the quill IS NOT, h_t must be zero.
     ink_rate_elsewhere = h_t[~is_under_tip]
     loss_quiescence = (ink_rate_elsewhere**2).mean()
     
@@ -153,7 +138,7 @@ def physics_loss_v5_sourceterm(model, dataset, x, y, t):
     return loss_source, loss_quiescence
 
 # ============================================
-# TRAINING (Driven by the new Physics Loss)
+# TRAINING
 # ============================================
 def train_pinn_v5(model, dataset, epochs=15000, lr=1e-3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -167,7 +152,6 @@ def train_pinn_v5(model, dataset, epochs=15000, lr=1e-3):
     for epoch in range(epochs):
         optimizer.zero_grad()
         
-        # --- Boundary Condition Losses ---
         n_data = 800
         ic_pts = dataset.get_initial_points(n_data)
         x_ic, y_ic = torch.tensor(ic_pts[:,0], dtype=torch.float32, device=device), torch.tensor(ic_pts[:,1], dtype=torch.float32, device=device)
@@ -178,12 +162,10 @@ def train_pinn_v5(model, dataset, epochs=15000, lr=1e-3):
         h_pred_fc = model(x_fc_t, y_fc_t, torch.ones_like(x_fc_t))
         loss_fc = ((h_pred_fc - h_fc_t) ** 2).mean()
 
-        # --- Physics Loss ---
         phys_pts = dataset.get_physics_points(2500)
         x_p, y_p, t_p = torch.tensor(phys_pts[:,0], dtype=torch.float32, device=device), torch.tensor(phys_pts[:,1], dtype=torch.float32, device=device), torch.tensor(phys_pts[:,2], dtype=torch.float32, device=device)
         loss_src, loss_q = physics_loss_v5_sourceterm(model, dataset, x_p, y_p, t_p)
         
-        # --- Total Loss ---
         loss = (lambda_data * (loss_ic + loss_fc) +
                 lambda_source * loss_src +
                 lambda_quiescence * loss_q)
