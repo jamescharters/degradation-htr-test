@@ -34,10 +34,14 @@ class QuillPINN_V14(nn.Module):
         for _ in range(num_layers - 1): layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
         layers.append(nn.Linear(hidden_dim, 1))
         self.network = nn.Sequential(*layers)
-        print(f"✓ Model created (Params: {sum(p.numel for p in self.parameters()):,})")
+        # --- THE FIX IS HERE ---
+        # Changed p.numel to p.numel()
+        print(f"✓ Model created (Params: {sum(p.numel() for p in self.parameters()):,})")
+
     def encode_time(self, t):
         freqs = 2.0 ** torch.arange(self.time_encoding_dim//2, device=t.device, dtype=torch.float32)
         t_expanded = t.unsqueeze(-1) * freqs.unsqueeze(0); return torch.cat([torch.sin(2*np.pi*t_expanded), torch.cos(2*np.pi*t_expanded)], dim=-1)
+    
     def forward(self, x, y, t):
         if x.dim()==0: x=x.unsqueeze(0)
         if y.dim()==0: y=y.unsqueeze(0)
@@ -144,7 +148,7 @@ def train_pinn_v14(model, dataset, phases=[5000, 10000, 10000]):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     for epoch in range(phases[2]):
         model.train(); optimizer.zero_grad()
-        # Boundary loss (low weight, to prevent drift)
+        # Boundary loss
         x_ic, y_ic = dataset.get_initial_points(512)
         loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
         x_fc, y_fc, h_fc = dataset.get_final_points(512)
