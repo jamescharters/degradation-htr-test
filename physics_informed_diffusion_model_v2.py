@@ -775,7 +775,7 @@ if __name__ == "__main__":
     
     # 3. Ablation study
     print("Running Diagnostic 3: Ablation Study...")
-    ablation_study(model, physics_weights=[0.0, 0.1, 0.5, 1.0, 2.0])
+    ablation_study(model, physics_weights=[0.0, 0.1, 0.5, 1.0, 2.0, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10])
     
     # 4. Final comparison
     print("Running Final Comparison...")
