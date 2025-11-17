@@ -34,14 +34,10 @@ class QuillPINN_V14(nn.Module):
         for _ in range(num_layers - 1): layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
         layers.append(nn.Linear(hidden_dim, 1))
         self.network = nn.Sequential(*layers)
-        # --- THE FIX IS HERE ---
-        # Changed p.numel to p.numel()
         print(f"✓ Model created (Params: {sum(p.numel() for p in self.parameters()):,})")
-
     def encode_time(self, t):
         freqs = 2.0 ** torch.arange(self.time_encoding_dim//2, device=t.device, dtype=torch.float32)
         t_expanded = t.unsqueeze(-1) * freqs.unsqueeze(0); return torch.cat([torch.sin(2*np.pi*t_expanded), torch.cos(2*np.pi*t_expanded)], dim=-1)
-    
     def forward(self, x, y, t):
         if x.dim()==0: x=x.unsqueeze(0)
         if y.dim()==0: y=y.unsqueeze(0)
@@ -115,9 +111,14 @@ def train_pinn_v14(model, dataset, phases=[5000, 10000, 10000]):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     for epoch in range(phases[0]):
         model.train(); optimizer.zero_grad()
-        x_ic, y_ic = dataset.get_initial_points(1024)
+        n_data = 1024
+        
+        # --- FIX #1: Correctly unpack the initial condition points ---
+        ic_pts = dataset.get_initial_points(n_data)
+        x_ic, y_ic = ic_pts[:, 0], ic_pts[:, 1]
+        
         loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
-        x_fc, y_fc, h_fc = dataset.get_final_points(1024)
+        x_fc, y_fc, h_fc = dataset.get_final_points(n_data)
         h_pred_fc = model(x_fc, y_fc, torch.ones_like(x_fc))
         loss_fc = ((h_pred_fc - h_fc) ** 2).mean()
         total_loss = 200.0 * (loss_ic + loss_fc)
@@ -149,10 +150,11 @@ def train_pinn_v14(model, dataset, phases=[5000, 10000, 10000]):
     for epoch in range(phases[2]):
         model.train(); optimizer.zero_grad()
         # Boundary loss
-        x_ic, y_ic = dataset.get_initial_points(512)
-        loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
-        x_fc, y_fc, h_fc = dataset.get_final_points(512)
-        h_pred_fc = model(x_fc, y_fc, torch.ones_like(x_fc)); loss_fc = ((h_pred_fc - h_fc) ** 2).mean()
+        ic_pts_polish = dataset.get_initial_points(512)
+        x_ic_p, y_ic_p = ic_pts_polish[:, 0], ic_pts_polish[:, 1]
+        loss_ic = (model(x_ic_p, y_ic_p, torch.zeros_like(x_ic_p)) ** 2).mean()
+        x_fc_p, y_fc_p, h_fc_p = dataset.get_final_points(512)
+        h_pred_fc = model(x_fc_p, y_fc_p, torch.ones_like(x_fc_p)); loss_fc = ((h_pred_fc - h_fc_p) ** 2).mean()
         loss_boundary = loss_ic + loss_fc
         # Full physics
         x_src, y_src, t_src = dataset.get_on_path_points(1500)
@@ -163,7 +165,11 @@ def train_pinn_v14(model, dataset, phases=[5000, 10000, 10000]):
         x_sh.requires_grad_(); y_sh.requires_grad_(); t_sh.requires_grad_()
         h_sh = model(x_sh, y_sh, t_sh); h_t_sh = compute_gradient(h_sh, t_sh)
         loss_sheath = (h_t_sh**2).mean()
-        x_q, y_q, t_q = dataset.get_off_path_points(1024).T
+
+        # --- FIX #2: Correctly unpack the off-path points ---
+        off_path_pts = dataset.get_off_path_points(1024)
+        x_q, y_q, t_q = off_path_pts[:, 0], off_path_pts[:, 1], off_path_pts[:, 2]
+        
         x_q.requires_grad_(); y_q.requires_grad_(); t_q.requires_grad_()
         h_q = model(x_q, y_q, t_q); h_t_q = compute_gradient(h_q, t_q)
         loss_quiescence = (h_t_q**2).mean()
