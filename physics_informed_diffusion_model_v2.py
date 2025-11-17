@@ -222,15 +222,17 @@ class PhysicsInformedDiffusion(nn.Module):
     @torch.no_grad()
     def sample(self, batch_size=1, apply_physics=True, return_trajectory=False):
         """
-        Generate samples with a corrected predict-then-project methodology.
-        This ensures the final state of each step is divergence-free.
+        Generate samples with the definitive predict-then-project methodology.
+        This version corrects all dimension-handling for robust operation.
         """
         x = torch.randn(batch_size, 2, self.img_size, self.img_size, device=device)
         
-        # To make the vanilla comparison fair, project the initial noise too for the physics run
+        # Project the initial noise to start on the correct manifold
         if apply_physics:
-             vx, vy, _, _ = project_to_divergence_free_fft(x[:, 0:1], x[:, 1:2])
-             x = torch.cat([vx, vy], dim=1)
+             # Use integer indexing to get (B, H, W) tensors
+             vx, vy, _, _ = project_to_divergence_free_fft(x[:, 0], x[:, 1])
+             # Use torch.stack to correctly recombine into (B, 2, H, W)
+             x = torch.stack([vx, vy], dim=1)
 
         trajectory_divs = [] if return_trajectory else None
         
@@ -242,34 +244,28 @@ class PhysicsInformedDiffusion(nn.Module):
             alpha_bar = self.alpha_bars[t]
             x0_pred = (x - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
             
-            # --- The Original (Flawed) Projection Spot Was Here ---
-
             # 2. Compute the next step x_{t-1} using the standard DDPM formula
             if t > 0:
-                alpha = self.alphas[t]
                 beta = self.betas[t]
                 alpha_bar_prev = self.alpha_bars[t-1]
                 posterior_var = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
                 
-                # Combine the predicted clean image and the predicted noise
                 mean_pred_term1 = torch.sqrt(alpha_bar_prev) * x0_pred
                 mean_pred_term2 = torch.sqrt(1 - alpha_bar_prev - posterior_var) * noise_pred
-                
                 mean = mean_pred_term1 + mean_pred_term2
                 
-                # Add random noise for the stochastic step
-                noise = torch.randn_like(x) if t > 0 else 0
+                noise = torch.randn_like(x)
                 x = mean + torch.sqrt(posterior_var) * noise
             else:
                 x = x0_pred
 
-            # 3. <<< THE CORRECTED, FINAL PROJECTION STEP >>>
-            # After calculating x_{t-1}, project it onto the divergence-free manifold.
-            # This ensures the input to the NEXT step is perfectly physical.
+            # 3. Project the final result of the step onto the physical manifold
             if apply_physics:
                 div_before = compute_divergence(x[:, 0], x[:, 1]).abs().mean().item()
-                vx_proj, vy_proj, _, div_after = project_to_divergence_free_fft(x[:, 0:1], x[:, 1:2])
-                x = torch.cat([vx_proj, vy_proj], dim=1)
+                # Use integer indexing here as well
+                vx_proj, vy_proj, _, div_after = project_to_divergence_free_fft(x[:, 0], x[:, 1])
+                # Use torch.stack to correctly recombine
+                x = torch.stack([vx_proj, vy_proj], dim=1)
                 
                 if return_trajectory:
                     trajectory_divs.append({'step': self.timesteps - i, 'div_before': div_before, 'div_after': div_after})
