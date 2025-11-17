@@ -401,6 +401,72 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
 
+def visualize_error_as_fog(model):
+    """
+    An intuitive visualization that shows physical error as a "fog" or "blur"
+    overlaid on the vortex. This creates a simple, direct comparison between
+- a messy/blurry image and a sharp/clear one.
+    """
+    print("="*70)
+    print("DIAGNOSTIC: Error as Fog (Blur vs. Sharp)")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate one of each sample type ---
+    print("Generating samples to visualize...")
+    with torch.no_grad():
+        # Generate two separate samples for a fair comparison
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        physics_sample = model.sample(1, apply_physics=True)[0]
+
+    # --- Step 2: Calculate the Vortex (for the background image) ---
+    vort_v = compute_curl(vanilla_sample[0:1], vanilla_sample[1:2])[0].cpu().numpy()
+    vort_p = compute_curl(physics_sample[0:1], physics_sample[1:2])[0].cpu().numpy()
+    
+    # --- Step 3: Calculate the Error (for the fog overlay) ---
+    # We use the absolute value of divergence for the fog density
+    error_fog_v = compute_divergence(vanilla_sample[0:1], vanilla_sample[1:2]).abs()[0].cpu().numpy()
+    error_fog_p = compute_divergence(physics_sample[0:1], physics_sample[1:2]).abs()[0].cpu().numpy()
+    print("✓ Computed vorticity (image) and error (fog).")
+
+    # --- Step 4: Set up the plot ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # --- Honest Scaling for a fair comparison ---
+    # Color scale for the vortex is shared
+    max_vort = max(np.abs(vort_v).max(), np.abs(vort_p).max())
+    vort_norm = colors.Normalize(vmin=-max_vort, vmax=max_vort)
+    
+    # Fog scale is based on the max error of the vanilla model
+    max_error_for_fog = error_fog_v.max()
+    fog_norm = colors.Normalize(vmin=0, vmax=max_error_for_fog)
+
+    # --- Plot the Vanilla Model (Vortex + Thick Fog) ---
+    axes[0].imshow(vort_v, cmap='RdBu_r', norm=vort_norm)
+    # Overlay the error as a semi-transparent white fog
+    axes[0].imshow(error_fog_v, cmap='Greys', norm=fog_norm, alpha=0.7)
+    axes[0].set_title("Standard A.I.\n(Physically 'Blurry')", fontsize=16, fontweight='bold')
+    axes[0].axis('off')
+
+    # --- Plot the Physics-Informed Model (Vortex + No Fog) ---
+    axes[1].imshow(vort_p, cmap='RdBu_r', norm=vort_norm)
+    # Overlay its error fog - it should be almost completely transparent
+    axes[1].imshow(error_fog_p, cmap='Greys', norm=fog_norm, alpha=0.7)
+    axes[1].set_title("Our A.I.\n(Physically 'Sharp')", fontsize=16, fontweight='bold')
+    axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('diagnostic_error_as_fog.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # --- Print quantitative results for confirmation ---
+    mean_error_v = error_fog_v.mean()
+    mean_error_p = error_fog_p.mean()
+    print("\n--- Quantitative Summary ---")
+    print(f"Vanilla Mean Error (Average Fog Density):   {mean_error_v:.6f}")
+    print(f"Physics Mean Error (Average Fog Density):   {mean_error_p:.6f}")
+    print(f"Clarity Improvement:                        {mean_error_v / (mean_error_p + 1e-9):.1f}x")
 
 def visualize_vortex_and_error_landscape(model):
     """
@@ -1141,6 +1207,9 @@ if __name__ == "__main__":
 
     print("Running the Landscape Visualization and Vortex...")
     visualize_vortex_and_error_landscape(model)
+
+    print("Running the Fog Visualization...")
+    visualize_error_as_fog(model)
 
     # Summary
     print("\n" + "="*70)
