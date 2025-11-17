@@ -400,6 +400,86 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # ============================================================================
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
+
+def visualize_leaky_bucket(model):
+    """
+    The ultimate intuitive visualization: The "Leaky Bucket" test.
+    This directly shows the effect of sources (faucets) and sinks (drains)
+    on a flat water surface. It is robust and impossible to misinterpret.
+    """
+    print("="*70)
+    print("DIAGNOSTIC ULTIMATE: The Leaky Bucket Test")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate a single flow field and its corrected version ---
+    print("Generating a flow field to test...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        vx_v, vy_v = vanilla_sample[0:1], vanilla_sample[1:2]
+        
+        # Create the physically corrected version for a perfect A/B test
+        vx_p, vy_p, _, _ = project_to_divergence_free_fft(vx_v, vy_v)
+
+    # --- Step 2: Compute the divergence fields (the 'error' fields) ---
+    div_v = compute_divergence(vx_v, vy_v)
+    div_p = compute_divergence(vx_p, vy_p)
+    print("✓ Computed divergence fields (the sources and sinks).")
+
+    # --- Step 3: Set up the simulation ---
+    print("Setting up water surface simulation...")
+    num_steps = 100
+    
+    # Start with two perfectly flat water surfaces at level 0.5
+    water_level_v = torch.full_like(div_v, 0.5)
+    water_level_p = torch.full_like(div_p, 0.5)
+
+    # We need a small learning rate to accumulate the effect over time
+    # We also scale by the max divergence to make the effect consistent
+    max_abs_div = div_v.abs().max()
+    dt = 0.5 / (max_abs_div + 1e-8)
+
+    frames = []
+    print("Running simulation and capturing frames...")
+    for step in range(num_steps):
+        # Apply the divergence: sources add water, sinks remove water
+        water_level_v += div_v * dt
+        water_level_p += div_p * dt
+
+        # --- Create a frame for the GIF every few steps ---
+        if step % 2 == 0:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+            
+            # Quantitative measure: Std Dev of water level (0 is perfectly flat)
+            std_v = water_level_v.std().item()
+            std_p = water_level_p.std().item()
+
+            # Plot Vanilla Surface
+            im1 = axes[0].imshow(water_level_v[0].cpu().numpy(), cmap='ocean', vmin=0, vmax=1)
+            axes[0].set_title(f"Vanilla Flow: Faucets & Drains\nSurface Unevenness: {std_v:.4f}", fontsize=12)
+            axes[0].axis('off')
+
+            # Plot Physics-Informed Surface
+            im2 = axes[1].imshow(water_level_p[0].cpu().numpy(), cmap='ocean', vmin=0, vmax=1)
+            axes[1].set_title(f"Physics Flow: Perfectly Sealed\nSurface Unevenness: {std_p:.4f}", fontsize=12)
+            axes[1].axis('off')
+            
+            plt.suptitle(f"The 'Leaky Bucket' Test | Time: {step+1}", fontsize=16, fontweight='bold')
+            plt.tight_layout(rect=[0, 0, 1, 0.93])
+            
+            # Convert plot to image array
+            fig.canvas.draw()
+            rgba_buffer = fig.canvas.buffer_rgba()
+            frame = np.asarray(rgba_buffer)[:, :, :3]
+            frames.append(frame)
+            plt.close(fig)
+
+    # --- Step 4: Save the GIF ---
+    print("Saving animation to diagnostic_leaky_bucket.gif...")
+    imageio.mimsave('diagnostic_leaky_bucket.gif', frames, fps=15)
+    print("✓ Done! Check for diagnostic_leaky_bucket.gif")
+
 def visualize_ink_drop_advection(model):
     """
     The definitive intuitive visualization. This version normalizes the flow
@@ -905,6 +985,10 @@ if __name__ == "__main__":
 
     print("Running Intuitive Ink Drop Visualization...")
     visualize_ink_drop_advection(model)
+
+    # Call the new visualization
+    print("Running the Leaky Bucket Test...")
+    visualize_leaky_bucket(model)
 
     # Summary
     print("\n" + "="*70)
