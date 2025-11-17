@@ -400,6 +400,85 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
 
+def visualize_flow_fields(model):
+    """
+    Provides an intuitive visualization using stream plots to show the actual
+    fluid flow, comparing the vanilla and physics-informed models.
+    """
+    print("="*70)
+    print("DIAGNOSTIC EXTRA: Intuitive Flow Visualization")
+    print("="*70)
+    
+    model.eval()
+    
+    print("Generating samples for intuitive visualization...")
+    with torch.no_grad():
+        # Generate one sample of each type
+        sample_vanilla = model.sample(1, apply_physics=False)[0].cpu().numpy()
+        sample_physics = model.sample(1, apply_physics=True)[0].cpu().numpy()
+
+    vx_v, vy_v = sample_vanilla[0], sample_vanilla[1]
+    vx_p, vy_p = sample_physics[0], sample_physics[1]
+
+    # Calculate divergence for titles
+    div_v = np.abs(compute_divergence(torch.from_numpy(vx_v).unsqueeze(0), torch.from_numpy(vy_v).unsqueeze(0)).numpy()).mean()
+    div_p = np.abs(compute_divergence(torch.from_numpy(vx_p).unsqueeze(0), torch.from_numpy(vy_p).unsqueeze(0)).numpy()).mean()
+
+    # Calculate speed for background color
+    speed_v = np.sqrt(vx_v**2 + vy_v**2)
+    speed_p = np.sqrt(vx_p**2 + vy_p**2)
+
+    # Create coordinate grid
+    y = np.linspace(0, 1, model.img_size)
+    x = np.linspace(0, 1, model.img_size)
+    X, Y = np.meshgrid(x, y)
+
+    # --- Plotting ---
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+
+    # -- Row 1: Vanilla Model --
+    # Stream Plot
+    ax = axes[0, 0]
+    ax.streamplot(X, Y, vx_v, vy_v, color='black', linewidth=1, density=1.5)
+    ax.imshow(speed_v, extent=(0, 1, 0, 1), origin='lower', cmap='viridis', alpha=0.8)
+    ax.set_title("Vanilla Model Flow", fontsize=14, fontweight='bold')
+    ax.set_ylabel("Flow (Stream Plot)", fontsize=12, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Divergence Plot
+    ax = axes[0, 1]
+    div_v_field = compute_divergence(torch.from_numpy(vx_v).unsqueeze(0), torch.from_numpy(vy_v).unsqueeze(0))[0].numpy()
+    im = ax.imshow(np.abs(div_v_field), cmap='hot', vmin=0, vmax=0.5)
+    ax.set_title(f"Mean |Divergence| = {div_v:.5f}", fontsize=14, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # -- Row 2: Physics-Informed Model --
+    # Stream Plot
+    ax = axes[1, 0]
+    ax.streamplot(X, Y, vx_p, vy_p, color='black', linewidth=1, density=1.5)
+    ax.imshow(speed_p, extent=(0, 1, 0, 1), origin='lower', cmap='viridis', alpha=0.8)
+    ax.set_title("Physics-Informed Model Flow", fontsize=14, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Divergence Plot
+    ax = axes[1, 1]
+    div_p_field = compute_divergence(torch.from_numpy(vx_p).unsqueeze(0), torch.from_numpy(vy_p).unsqueeze(0))[0].numpy()
+    im = ax.imshow(np.abs(div_p_field), cmap='hot', vmin=0, vmax=0.5)
+    ax.set_title(f"Mean |Divergence| = {div_p:.5f}", fontsize=14, fontweight='bold')
+    ax.set_xlabel("Physical Error (|Divergence|)", fontsize=12, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    plt.suptitle("Intuitive Comparison: Visualizing the Flow Field", fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig('diagnostic_intuitive_flow.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
 def visualize_projection_effect(model):
     """Show before/after of physics projection on a single sample"""
     print("\n" + "="*70)
@@ -450,16 +529,16 @@ def visualize_projection_effect(model):
         axes[0, 2].axis('off')
         
         # After projection
-        axes[1, 0].imshow(curl_after[0].cpu().numpy(), cmap='RdBu_r', vmin=-2, vmax=2)
+        axes[1, 0].imshow(curl_after.cpu().numpy(), cmap='RdBu_r', vmin=-2, vmax=2)
         axes[1, 0].set_title('After: Vorticity\n(preserved)', fontsize=12, fontweight='bold')
         axes[1, 0].axis('off')
         
-        im2 = axes[1, 1].imshow(div_after_field[0].cpu().numpy(), cmap='RdBu_r', vmin=-0.5, vmax=0.5)
+        im2 = axes[1, 1].imshow(div_after_field.cpu().numpy(), cmap='RdBu_r', vmin=-0.5, vmax=0.5)
         axes[1, 1].set_title(f'After: Divergence\n(mean |div| = {div_a:.6f})', fontsize=12, fontweight='bold')
         axes[1, 1].axis('off')
         plt.colorbar(im2, ax=axes[1, 1], fraction=0.046)
         
-        axes[1, 2].imshow(np.abs(div_after_field[0].cpu().numpy()), cmap='hot', vmin=0, vmax=0.5)
+        axes[1, 2].imshow(np.abs(div_after_field.cpu().numpy()), cmap='hot', vmin=0, vmax=0.5)
         axes[1, 2].set_title(f'After: |Divergence|\n(reduced {div_b/div_a:.1f}x)', fontsize=12, fontweight='bold')
         axes[1, 2].axis('off')
         
@@ -702,6 +781,10 @@ if __name__ == "__main__":
     print("Running Final Comparison...")
     final_comparison(model, n_samples=4)
     
+    # 5. NEW INTUITIVE VISUALIZATION
+    print("Running Intuitive Flow Visualization...")
+    visualize_flow_fields(model)
+
     # Summary
     print("\n" + "="*70)
     print("DIAGNOSTIC SUMMARY")
