@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Quill PINN V18 (TUNED & FINAL)
+Quill PINN V18 (TUNED & FINAL - CORRECTED)
 Based on the successful V18 Simple Synthesis baseline.
-This version makes one minimal, targeted change to improve the final-frame
-accuracy: a moderate increase in the boundary loss weight during fine-tuning.
+This version fixes the typo in the dataset class and applies the tuning
+to prioritize final-frame accuracy.
 """
 
 import torch
@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 
 print("=" * 60)
-print("QUILL PHYSICS PINN V18 (TUNED & FINAL)")
+print("QUILL PHYSICS PINN V18 (TUNED & FINAL - CORRECTED)")
 print("=" * 60)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -51,7 +51,7 @@ class QuillPINN_V18(nn.Module):
 def compute_gradient(o, i): return torch.autograd.grad(o, i, grad_outputs=torch.ones_like(o), create_graph=True, retain_graph=True, allow_unused=True)[0]
 
 # ============================================
-# DATASET
+# DATASET (with the corrected function name)
 # ============================================
 class QuillDataset_V18:
     def __init__(self, prefix, metadata_path):
@@ -78,12 +78,15 @@ class QuillDataset_V18:
             else: positions.append((np.nan, np.nan))
         return torch.tensor(positions, dtype=torch.float32, device=t_values.device)
     def get_initial_points(self, n): return torch.rand(n, 2, device=device)
-    def get__points(self, n):
+    
+    # --- THE FIX IS HERE ---
+    def get_final_points(self, n):
         x_idx, y_idx = np.random.randint(0,self.width,n), np.random.randint(0,self.height,n)
         x = torch.tensor(x_idx/(self.width-1), dtype=torch.float32, device=device)
         y = torch.tensor(y_idx/(self.height-1), dtype=torch.float32, device=device)
         h = torch.tensor(self.image_final[y_idx, x_idx], dtype=torch.float32, device=device)
         return x, y, h
+        
     def get_off_path_points(self, n): return torch.rand(n, 3, device=device)
     def get_on_path_points(self, n):
         stroke_start_norm = self.metadata['strokes'][0]['start_time'] / self.total_time
