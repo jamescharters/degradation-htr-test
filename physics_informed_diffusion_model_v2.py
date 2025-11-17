@@ -11,6 +11,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import imageio
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.cm as cm
 
 print("=" * 70)
 print("PHYSICS-INFORMED GENERATIVE MODEL (PIGM) - FULL DIAGNOSTIC")
@@ -395,6 +397,71 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # ============================================================================
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
+
+def visualize_error_landscape(model):
+    """
+    A direct, static 3D visualization of the physical error itself.
+    This creates a topographical map where height = |divergence|.
+    This method is robust and provides an intuitive, honest comparison.
+    """
+    print("="*70)
+    print("DIAGNOSTIC: The Error Landscape Map")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate one of each sample type ---
+    print("Generating samples to map their error...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        physics_sample = model.sample(1, apply_physics=True)[0]
+
+    # --- Step 2: Compute the absolute divergence (the 'error height') ---
+    # We use the absolute value because we care about the magnitude of the error
+    error_v = compute_divergence(vanilla_sample[0:1], vanilla_sample[1:2]).abs()[0].cpu().numpy()
+    error_p = compute_divergence(physics_sample[0:1], physics_sample[1:2]).abs()[0].cpu().numpy()
+    print("✓ Computed the physical error fields.")
+
+    # --- Step 3: Set up the 3D plot ---
+    fig = plt.figure(figsize=(16, 8))
+    
+    # Create the coordinate grid for the surface plot
+    H, W = error_v.shape
+    X, Y = np.meshgrid(np.arange(W), np.arange(H))
+
+    # --- HONEST SCALING: Determine the max error from the WORST model ---
+    # Both plots will share the same height scale for a fair comparison.
+    max_error = error_v.max()
+    
+    # --- Plot the Vanilla Error Landscape ---
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    surf1 = ax1.plot_surface(X, Y, error_v, cmap=cm.viridis, linewidth=0, antialiased=False)
+    ax1.set_title("Vanilla Model: A Mountainous Landscape of Error", fontsize=14, fontweight='bold', pad=20)
+    ax1.set_zlim(0, max_error) # Use the shared scale
+    ax1.set_xlabel("X coordinate")
+    ax1.set_ylabel("Y coordinate")
+    ax1.set_zlabel("Amount of Physical Error")
+
+    # --- Plot the Physics-Informed Error Landscape ---
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    surf2 = ax2.plot_surface(X, Y, error_p, cmap=cm.viridis, linewidth=0, antialiased=False)
+    ax2.set_title("Physics Model: An Almost Flat Plain of Correctness", fontsize=14, fontweight='bold', pad=20)
+    ax2.set_zlim(0, max_error) # Use the shared scale
+    ax2.set_xlabel("X coordinate")
+    ax2.set_ylabel("Y coordinate")
+    ax2.set_zlabel("Amount of Physical Error")
+
+    plt.suptitle("Direct Comparison of Physical Error", fontsize=18, fontweight='bold')
+    plt.savefig('diagnostic_error_landscape.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # --- Print quantitative results for confirmation ---
+    mean_error_v = error_v.mean()
+    mean_error_p = error_p.mean()
+    print("\n--- Quantitative Summary ---")
+    print(f"Vanilla Mean Error (Average Mountain Height):   {mean_error_v:.6f}")
+    print(f"Physics Mean Error (Average Plain Height):      {mean_error_p:.6f}")
+    print(f"Improvement Factor:                             {mean_error_v / (mean_error_p + 1e-9):.1f}x")
 
 def visualize_leaky_bucket(model):
     """
@@ -984,6 +1051,9 @@ if __name__ == "__main__":
     # Call the new visualization
     print("Running the Leaky Bucket Test...")
     visualize_leaky_bucket(model)
+
+    print("Running the Landscape Visualization...")
+    visualize_error_landscape(model)
 
     # Summary
     print("\n" + "="*70)
