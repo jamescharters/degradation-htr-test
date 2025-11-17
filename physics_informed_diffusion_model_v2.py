@@ -222,62 +222,61 @@ class PhysicsInformedDiffusion(nn.Module):
     @torch.no_grad()
     def sample(self, batch_size=1, apply_physics=True, return_trajectory=False):
         """
-        Generate samples with optional trajectory tracking.
-        
-        Args:
-            batch_size: number of samples
-            apply_physics: whether to apply divergence-free projection
-            return_trajectory: if True, return divergence at each step
+        Generate samples with a corrected predict-then-project methodology.
+        This ensures the final state of each step is divergence-free.
         """
         x = torch.randn(batch_size, 2, self.img_size, self.img_size, device=device)
         
+        # To make the vanilla comparison fair, project the initial noise too for the physics run
+        if apply_physics:
+             vx, vy, _, _ = project_to_divergence_free_fft(x[:, 0:1], x[:, 1:2])
+             x = torch.cat([vx, vy], dim=1)
+
         trajectory_divs = [] if return_trajectory else None
         
         for i, t in enumerate(reversed(range(self.timesteps))):
             t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
-            # Predict noise
+            # 1. Predict noise and the corresponding clean image
             noise_pred = self.model(x, t_tensor)
-            
-            # DDPM formula
-            alpha = self.alphas[t]
             alpha_bar = self.alpha_bars[t]
-            beta = self.betas[t]
-            
-            # Predicted clean sample
             x0_pred = (x - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
             
-            # PHYSICS PROJECTION
-            if apply_physics:
-                vx, vy = x0_pred[:, 0], x0_pred[:, 1]
-                vx_proj, vy_proj, div_before, div_after = project_to_divergence_free_fft(vx, vy)
-                x0_pred = torch.stack([vx_proj, vy_proj], dim=1)
-                
-                if return_trajectory:
-                    trajectory_divs.append({
-                        'step': self.timesteps - i,
-                        'div_before': div_before,
-                        'div_after': div_after
-                    })
-            else:
-                if return_trajectory:
-                    div = compute_divergence(x0_pred[:, 0], x0_pred[:, 1]).abs().mean().item()
-                    trajectory_divs.append({
-                        'step': self.timesteps - i,
-                        'div': div
-                    })
-            
-            # Compute x_{t-1}
+            # --- The Original (Flawed) Projection Spot Was Here ---
+
+            # 2. Compute the next step x_{t-1} using the standard DDPM formula
             if t > 0:
+                alpha = self.alphas[t]
+                beta = self.betas[t]
                 alpha_bar_prev = self.alpha_bars[t-1]
                 posterior_var = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
                 
-                mean = torch.sqrt(alpha_bar_prev) * x0_pred
-                mean += torch.sqrt(1 - alpha_bar_prev - posterior_var) * noise_pred
+                # Combine the predicted clean image and the predicted noise
+                mean_pred_term1 = torch.sqrt(alpha_bar_prev) * x0_pred
+                mean_pred_term2 = torch.sqrt(1 - alpha_bar_prev - posterior_var) * noise_pred
                 
-                x = mean + torch.sqrt(posterior_var) * torch.randn_like(x)
+                mean = mean_pred_term1 + mean_pred_term2
+                
+                # Add random noise for the stochastic step
+                noise = torch.randn_like(x) if t > 0 else 0
+                x = mean + torch.sqrt(posterior_var) * noise
             else:
                 x = x0_pred
+
+            # 3. <<< THE CORRECTED, FINAL PROJECTION STEP >>>
+            # After calculating x_{t-1}, project it onto the divergence-free manifold.
+            # This ensures the input to the NEXT step is perfectly physical.
+            if apply_physics:
+                div_before = compute_divergence(x[:, 0], x[:, 1]).abs().mean().item()
+                vx_proj, vy_proj, _, div_after = project_to_divergence_free_fft(x[:, 0:1], x[:, 1:2])
+                x = torch.cat([vx_proj, vy_proj], dim=1)
+                
+                if return_trajectory:
+                    trajectory_divs.append({'step': self.timesteps - i, 'div_before': div_before, 'div_after': div_after})
+            else:
+                 if return_trajectory:
+                    div = compute_divergence(x[:, 0], x[:, 1]).abs().mean().item()
+                    trajectory_divs.append({'step': self.timesteps - i, 'div': div})
         
         if return_trajectory:
             return x, trajectory_divs
