@@ -401,6 +401,98 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
 
+def visualize_ink_drop_advection_2(model):
+    """
+    The most intuitive visualization: simulating an ink drop in the flow.
+    This version centers the flow to emphasize swirling over drifting.
+    """
+    print("="*70)
+    print("DIAGNOSTIC ULTIMATE: Intuitive Ink Drop Simulation (Centered Flow)")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate ONE flow field and create a "fixed" version ---
+    print("Generating a single base flow field...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        vx_v, vy_v = vanilla_sample[0:1], vanilla_sample[1:2]
+        
+        vx_p, vy_p, _, _ = project_to_divergence_free_fft(vx_v, vy_v)
+
+    # --- NEW FIX: Center the velocity fields to remove overall drift ---
+    # This emphasizes the local swirling motion and keeps the ink in frame longer.
+    vx_v = vx_v - vx_v.mean()
+    vy_v = vy_v - vy_v.mean()
+    vx_p = vx_p - vx_p.mean()
+    vy_p = vy_p - vy_p.mean()
+    print("✓ Centered flow fields to emphasize vortices.")
+    # --- END OF FIX ---
+
+    # --- Step 2: Set up the simulation ---
+    print("Setting up ink drop simulation...")
+    num_steps = 100
+    dt = 0.1  # Timestep for advection
+    H, W = model.img_size, model.img_size
+    
+    y, x = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij')
+    ink_initial = torch.exp(-((x**2 + y**2) * 15.0)).to(device).unsqueeze(0).unsqueeze(0)
+    
+    ink_vanilla = ink_initial.clone()
+    ink_physics = ink_initial.clone()
+    
+    scale_factor = 2.5 # Increased slightly to make swirls more prominent
+    vx_v_norm = vx_v * dt * scale_factor / W
+    vy_v_norm = vy_v * dt * scale_factor / H
+    vx_p_norm = vx_p * dt * scale_factor / W
+    vy_p_norm = vy_p * dt * scale_factor / H
+
+    # --- Step 3: Run the simulation and store frames ---
+    print("Running simulation and capturing frames...")
+    frames = []
+    initial_ink_total = ink_initial.sum().item()
+
+    for step in range(num_steps):
+        base_grid = torch.stack([x, y], dim=2).to(device).unsqueeze(0)
+        
+        grid_v = base_grid - torch.stack([vx_v_norm[0], vy_v_norm[0]], dim=-1)
+        ink_vanilla = F.grid_sample(ink_vanilla, grid_v, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        grid_p = base_grid - torch.stack([vx_p_norm[0], vy_p_norm[0]], dim=-1)
+        ink_physics = F.grid_sample(ink_physics, grid_p, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+        if step % 2 == 0:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            
+            # Show ink conservation as a percentage of the start
+            ink_percent_v = (ink_vanilla.sum().item() / initial_ink_total) * 100
+            ink_percent_p = (ink_physics.sum().item() / initial_ink_total) * 100
+            
+            axes[0].imshow(ink_vanilla[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
+            axes[0].set_title(f"Vanilla Flow\nInk Remaining: {ink_percent_v:.1f}%", fontsize=12)
+            axes[0].axis('off')
+
+            axes[1].imshow(ink_physics[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
+            axes[1].set_title(f"Physics-Informed Flow\nInk Remaining: {ink_percent_p:.1f}%", fontsize=12)
+            axes[1].axis('off')
+            
+            plt.suptitle(f"Ink Drop Simulation | Step: {step+1}/{num_steps}", fontsize=14, fontweight='bold')
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            
+            fig.canvas.draw()
+            rgba_buffer = fig.canvas.buffer_rgba()
+            frame = np.asarray(rgba_buffer)[:, :, :3]
+            frames.append(frame)
+            plt.close(fig)
+            
+            if (step+2) % 20 == 0:
+                print(f"  ... captured frame {step//2 + 1} / {num_steps//2}")
+
+    # --- Step 4: Save the GIF ---
+    print("Saving animation to diagnostic_ink_drop.gif...")
+    imageio.mimsave('diagnostic_ink_drop_2.gif', frames, fps=15)
+    print("✓ Done!")
+
 def visualize_ink_drop_advection(model):
     """
     The most intuitive visualization: simulating an ink drop in the flow.
@@ -455,11 +547,11 @@ def visualize_ink_drop_advection(model):
         
         # Advect vanilla ink
         grid_v = base_grid - torch.stack([vx_v_norm[0], vy_v_norm[0]], dim=-1)
-        ink_vanilla = F.grid_sample(ink_vanilla, grid_v, mode='bilinear', padding_mode='border', align_corners=False)
+        ink_vanilla = F.grid_sample(ink_vanilla, grid_v, mode='bilinear', padding_mode='zeros', align_corners=False)
 
         # Advect physics ink
         grid_p = base_grid - torch.stack([vx_p_norm[0], vy_p_norm[0]], dim=-1)
-        ink_physics = F.grid_sample(ink_physics, grid_p, mode='bilinear', padding_mode='border', align_corners=False)
+        ink_physics = F.grid_sample(ink_physics, grid_p, mode='bilinear', padding_mode='zeros', align_corners=False)
 
         # --- Create a frame for the GIF every few steps ---
         if step % 2 == 0:
@@ -482,8 +574,12 @@ def visualize_ink_drop_advection(model):
             
             # Convert plot to image array
             fig.canvas.draw()
-            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            #frame = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            #frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            rgba_buffer = fig.canvas.buffer_rgba()
+            frame = np.asarray(rgba_buffer)
+            frame = frame[:, :, :3]            
+
             frames.append(frame)
             plt.close(fig)
             
@@ -882,6 +978,9 @@ if __name__ == "__main__":
 
     print("Running Intuitive Ink Drop Visualization...")
     visualize_ink_drop_advection(model)
+
+    print("Running ink drop visualisation 2")
+    visualize_ink_drop_advection_2(model)
 
     # Summary
     print("\n" + "="*70)
