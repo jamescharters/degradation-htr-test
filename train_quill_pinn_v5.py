@@ -22,7 +22,7 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"✓ Using device: {device}\n")
 
 # ============================================
-# MODEL & GRADIENT UTILS (Identical to V3/V4)
+# MODEL & GRADIENT UTILS
 # ============================================
 class QuillPINN_V5(nn.Module):
     def __init__(self, hidden_dim=256, num_layers=8, time_encoding_dim=32):
@@ -42,19 +42,25 @@ class QuillPINN_V5(nn.Module):
         return torch.cat([torch.sin(2*np.pi*t_expanded), torch.cos(2*np.pi*t_expanded)], dim=-1)
 
     def forward(self, x, y, t):
-        # Handle single value inputs for visualization
+        # Handle single value inputs during visualization for convenience
         if x.dim() == 0: x = x.unsqueeze(0)
         if y.dim() == 0: y = y.unsqueeze(0)
         if t.dim() == 0: t = t.unsqueeze(0)
+        
         t_encoded = self.encode_time(t)
         inputs = torch.cat([x.unsqueeze(-1), y.unsqueeze(-1), t_encoded], dim=-1)
         return torch.relu(self.network(inputs).squeeze(-1))
 
 def compute_gradient(output, input_tensor):
-    return torch.autograd.grad(output, input_tensor, grad_outputs=torch.ones_like(output), create_graph=True, retain_graph=True)[0]
+    grad = torch.autograd.grad(
+        output, input_tensor, 
+        grad_outputs=torch.ones_like(output), 
+        create_graph=True, retain_graph=True, allow_unused=True
+    )[0]
+    return grad
 
 # ============================================
-# DATASET (UPDATED with path interpolation)
+# DATASET (with corrected path interpolation)
 # ============================================
 class QuillDataset_V5:
     def __init__(self, prefix, metadata_path):
@@ -71,8 +77,12 @@ class QuillDataset_V5:
         print(f"  Total simulation time: {self.total_time:.2f}s")
 
     def get_quill_position_at_time(self, t_values):
+        # --- CORRECTED FUNCTION ---
+        # We .detach() the tensor because this numpy-based lookup is not part of the
+        # gradient computation. The original tensor remains on the computation graph.
+        t_values_np = t_values.detach().cpu().numpy()
+        
         positions = []
-        t_values_np = t_values.cpu().numpy()
         
         for t_norm in t_values_np:
             t_sim = t_norm * self.total_time
@@ -88,7 +98,11 @@ class QuillDataset_V5:
                 idx_float = progress * (len(points_arr) - 1)
                 idx0 = int(np.floor(idx_float))
                 idx1 = int(np.ceil(idx_float))
-                
+
+                # Robustness check to prevent index out of bounds
+                if idx0 >= len(points_arr): idx0 = len(points_arr) - 1
+                if idx1 >= len(points_arr): idx1 = len(points_arr) - 1
+
                 if idx0 == idx1:
                     pos = points_arr[idx0]
                 else:
@@ -108,14 +122,14 @@ class QuillDataset_V5:
     def get_physics_points(self, n_points): return np.random.rand(n_points, 3)
 
 # ============================================
-# NEW: THE "SOURCE TERM" PHYSICS LOSS
+# THE "SOURCE TERM" PHYSICS LOSS
 # ============================================
 def physics_loss_v5_sourceterm(model, dataset, x, y, t):
     x.requires_grad_(True); y.requires_grad_(True); t.requires_grad_(True)
     h = model(x, y, t)
     
     h_t = compute_gradient(h, t)
-    if h_t is None: return torch.tensor(0.0), torch.tensor(0.0)
+    if h_t is None: return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
     quill_pos = dataset.get_quill_position_at_time(t)
     quill_x, quill_y = quill_pos[:, 0].unsqueeze(1), quill_pos[:, 1].unsqueeze(1)
@@ -133,7 +147,6 @@ def physics_loss_v5_sourceterm(model, dataset, x, y, t):
     ink_rate_elsewhere = h_t[~is_under_tip]
     loss_quiescence = (ink_rate_elsewhere**2).mean()
     
-    # Handle cases where a mask is empty to avoid NaN
     if torch.isnan(loss_source): loss_source = torch.tensor(0.0, device=device)
     if torch.isnan(loss_quiescence): loss_quiescence = torch.tensor(0.0, device=device)
 
@@ -145,9 +158,9 @@ def physics_loss_v5_sourceterm(model, dataset, x, y, t):
 def train_pinn_v5(model, dataset, epochs=15000, lr=1e-3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    lambda_data = 150.0      # Boundary conditions are still critical
-    lambda_source = 20.0     # Force ink generation under the tip
-    lambda_quiescence = 20.0 # Force stillness away from the tip
+    lambda_data = 150.0
+    lambda_source = 20.0
+    lambda_quiescence = 20.0
 
     print("\nTraining with V5 Source Term Strategy...")
     
@@ -156,12 +169,10 @@ def train_pinn_v5(model, dataset, epochs=15000, lr=1e-3):
         
         # --- Boundary Condition Losses ---
         n_data = 800
-        # Initial (t=0)
         ic_pts = dataset.get_initial_points(n_data)
         x_ic, y_ic = torch.tensor(ic_pts[:,0], dtype=torch.float32, device=device), torch.tensor(ic_pts[:,1], dtype=torch.float32, device=device)
         loss_ic = (model(x_ic, y_ic, torch.zeros_like(x_ic)) ** 2).mean()
 
-        # Final (t=1)
         x_fc, y_fc, h_fc = dataset.get_final_points(n_data)
         x_fc_t, y_fc_t, h_fc_t = torch.tensor(x_fc, dtype=torch.float32, device=device), torch.tensor(y_fc, dtype=torch.float32, device=device), torch.tensor(h_fc, dtype=torch.float32, device=device)
         h_pred_fc = model(x_fc_t, y_fc_t, torch.ones_like(x_fc_t))
