@@ -1272,7 +1272,7 @@ def find_optimal_stirring_pattern(model, num_candidates=32):
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     
     # Create a grid for the stream plots
-    x, y = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size), indexing='ij')
+    x, y = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size), indexing='xy')
     
     # Plot the worst pattern
     axes[0].streamplot(x, y, worst_pattern[0], worst_pattern[1], color='red', density=1.5, linewidth=1.5)
@@ -1289,6 +1289,77 @@ def find_optimal_stirring_pattern(model, num_candidates=32):
     plt.suptitle("The AI found the most effective stirring pattern", fontsize=20, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     plt.savefig('practical_app_coffee_cooler.png', dpi=150)
+    plt.show()
+
+
+def find_optimal_stirring_pattern_gallery(model, num_candidates=64, num_to_show=5):
+    """
+    Uses the trained AI to find and display a range of stirring patterns,
+    from the worst to the best, based on their cooling effectiveness.
+    """
+    print("="*70)
+    print("PRACTICAL APPLICATION: Gallery of Coffee Cooling Patterns")
+    print("="*70)
+
+    # --- Step 1: The AI generates a large pool of ideas ---
+    print(f"1. AI is generating {num_candidates} unique, physically-valid stirring patterns...")
+    with torch.no_grad():
+        # We only use the physics-informed model because we need realistic ideas
+        candidates = model.sample(num_candidates, apply_physics=True)
+
+    # --- Step 2: Evaluate every idea using our simple 'Cooling Score' ---
+    print(f"2. Evaluating all {num_candidates} patterns for their cooling effectiveness...")
+    scores = calculate_cooling_score(candidates[:, 0], candidates[:, 1])
+
+    # --- Step 3: Sort all patterns by score to find the full spectrum ---
+    print("3. Ranking all patterns from worst to best...")
+    sorted_scores, sorted_indices = torch.sort(scores)
+
+    # --- Step 4: Select a few representative patterns to display ---
+    # We pick evenly spaced indices from the sorted list to get a good range.
+    # This gives us the patterns at roughly the 0%, 25%, 50%, 75%, and 100th percentiles.
+    indices_to_show = torch.linspace(0, num_candidates - 1, num_to_show, dtype=torch.long)
+    
+    selected_patterns = candidates[sorted_indices[indices_to_show]].cpu().numpy()
+    selected_scores = sorted_scores[indices_to_show].cpu().numpy()
+    
+    print(f"\n✓ Analysis complete! Displaying {num_to_show} patterns from the spectrum.")
+
+    # --- Step 5: Visualize the result as a gallery ---
+    fig, axes = plt.subplots(1, num_to_show, figsize=(num_to_show * 4, 5))
+    
+    # Create a grid for the stream plots. Use 'xy' indexing for streamplot.
+    x, y = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size), indexing='xy')
+    
+    # Use a colormap to visually represent the score (Red -> Yellow -> Green)
+    cmap = plt.get_cmap('RdYlGn')
+    
+    for i in range(num_to_show):
+        pattern = selected_patterns[i]
+        score = selected_scores[i]
+        
+        # Determine the color based on rank (0 is worst, num_to_show-1 is best)
+        color_val = i / (num_to_show - 1)
+        
+        ax = axes[i]
+        ax.streamplot(x, y, pattern[1], pattern[0], color=cmap(color_val), density=1.5, linewidth=1.2)
+        
+        # Descriptive titles
+        percentile = (i / (num_to_show - 1)) * 100
+        if i == 0:
+            title = f"Worst ({percentile:.0f}th Pctl)"
+        elif i == num_to_show - 1:
+            title = f"Best ({percentile:.0f}th Pctl)"
+        else:
+            title = f"~{percentile:.0f}th Percentile"
+
+        ax.set_title(f"{title}\n(Score: {score:.2f})", fontsize=12, fontweight='bold')
+        ax.set_aspect('equal')
+        ax.axis('off')
+    
+    plt.suptitle("AI-Generated Stirring Patterns, Ranked by Cooling Effectiveness", fontsize=18, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig('practical_app_coffee_cooler_gallery.png', dpi=150)
     plt.show()
 
 # ============================================================================
@@ -1364,7 +1435,8 @@ if __name__ == "__main__":
     visualize_error_as_noise(model)
 
     # === RUN THE PRACTICAL APPLICATION ===
-    find_optimal_stirring_pattern(model, num_candidates=32)
+    #find_optimal_stirring_pattern(model, num_candidates=32)
+    find_optimal_stirring_pattern_gallery(model, num_candidates=64, num_to_show=5)
 
     # Summary
     print("\n" + "="*70)
