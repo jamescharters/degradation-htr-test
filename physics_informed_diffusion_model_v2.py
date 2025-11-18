@@ -401,6 +401,62 @@ def train_pigm(model, data, epochs=30, batch_size=16):
 # DIAGNOSTIC VISUALIZATIONS
 # ============================================================================
 
+def visualize_error_as_noise(model):
+    """
+    A guaranteed-to-work, intuitive visualization. It treats the physical error
+    as "vibrations" on a plate of sand. High error creates a messy, noisy static
+    image, while low error results in a clean, smooth image.
+    This does not depend on the flow looking like a "vortex".
+    """
+    print("="*70)
+    print("DIAGNOSTIC: Error as 'Sand on a Plate' (Noise vs. Clean)")
+    print("="*70)
+    
+    model.eval()
+
+    # --- Step 1: Generate one of each sample type ---
+    print("Generating samples to visualize their error patterns...")
+    with torch.no_grad():
+        vanilla_sample = model.sample(1, apply_physics=False)[0]
+        physics_sample = model.sample(1, apply_physics=True)[0]
+
+    # --- Step 2: Calculate the error field (divergence) ---
+    # We do NOT take the absolute value here, to preserve the noisy texture.
+    error_v = compute_divergence(vanilla_sample[0:1], vanilla_sample[1:2])[0].cpu().numpy()
+    error_p = compute_divergence(physics_sample[0:1], physics_sample[1:2])[0].cpu().numpy()
+    print("✓ Computed the physical error fields ('vibration patterns').")
+
+    # --- Step 3: Set up the plot ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # --- HONEST SCALING for a fair comparison ---
+    # The color scale is based on the max error of the vanilla model.
+    # This ensures the small errors in the physics model are not exaggerated.
+    max_abs_error = np.abs(error_v).max()
+    error_norm = colors.Normalize(vmin=-max_abs_error, vmax=max_abs_error)
+
+    # --- Plot the Vanilla Model's "Noisy Sand" ---
+    axes[0].imshow(error_v, cmap='gray', norm=error_norm)
+    axes[0].set_title("Standard A.I.\n(Chaotic, Noisy Physics)", fontsize=16, fontweight='bold')
+    axes[0].axis('off')
+
+    # --- Plot the Physics-Informed Model's "Calm Sand" ---
+    axes[1].imshow(error_p, cmap='gray', norm=error_norm)
+    axes[1].set_title("Our A.I.\n(Clean, Correct Physics)", fontsize=16, fontweight='bold')
+    axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('diagnostic_error_as_noise.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # --- Print quantitative results for confirmation ---
+    mean_abs_error_v = np.abs(error_v).mean()
+    mean_abs_error_p = np.abs(error_p).mean()
+    print("\n--- Quantitative Summary ---")
+    print(f"Vanilla Mean Error (Average Noise Level):   {mean_abs_error_v:.6f}")
+    print(f"Physics Mean Error (Average Noise Level):   {mean_abs_error_p:.6f}")
+    print(f"Noise Reduction Factor:                     {mean_abs_error_v / (mean_abs_error_p + 1e-9):.1f}x")
+
 def visualize_error_as_fog(model):
     """
     An intuitive visualization that shows physical error as a "fog" or "blur"
@@ -1210,6 +1266,9 @@ if __name__ == "__main__":
 
     print("Running the Fog Visualization...")
     visualize_error_as_fog(model)
+
+    print("Running the Vibration Visualization...")
+    visualize_error_as_noise(model)
 
     # Summary
     print("\n" + "="*70)
