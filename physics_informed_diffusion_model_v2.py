@@ -1199,6 +1199,99 @@ def final_comparison(model, n_samples=4):
 
 
 # ============================================================================
+# PRACTICAL APPLICATION: THE PERFECT COFFEE COOLER
+# ============================================================================
+
+def calculate_cooling_score(vx, vy):
+    """
+    A simple, intuitive function to evaluate how well a stirring pattern cools.
+    The logic: a good pattern moves fluid from the center towards the boundary.
+    This score rewards outward-pointing velocity near the edge of the 'cup'.
+    """
+    B, H, W = vx.shape
+    
+    # Create a coordinate grid from -1 to 1 (representing the coffee cup)
+    y, x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=vx.device),
+        torch.linspace(-1, 1, W, device=vx.device),
+        indexing='ij'
+    )
+    
+    # --- Rule 1: We care most about what happens near the edge of the cup ---
+    # Create a 'boundary mask' that is 1 near the edge and 0 in the center.
+    radius = torch.sqrt(x**2 + y**2)
+    boundary_mask = (radius > 0.8).float()
+
+    # --- Rule 2: We want the flow to be pointing OUTWARDS ---
+    # Calculate the radial (outward) component of the velocity
+    # Normalize the coordinate vectors to get radial direction vectors
+    rx = x / (radius + 1e-8)
+    ry = y / (radius + 1e-8)
+    # Project the velocity onto the radial direction
+    v_radial = vx * rx + vy * ry
+    # We only care about outward flow, so we ignore negative (inward) values
+    v_radial_outward = F.relu(v_radial)
+
+    # --- The Final Score ---
+    # The score is the total amount of outward flow in the boundary region.
+    # We sum over the height and width for each sample in the batch.
+    cooling_score = (v_radial_outward * boundary_mask).sum(dim=[1, 2])
+    
+    return cooling_score
+
+
+def find_optimal_stirring_pattern(model, num_candidates=32):
+    """
+    Uses the trained AI to find the best stirring pattern from a large batch.
+    """
+    print("="*70)
+    print("PRACTICAL APPLICATION: Finding the 'Perfect Coffee Cooler'")
+    print("="*70)
+
+    # --- Step 1: The AI generates thousands of ideas in seconds ---
+    print(f"1. AI is generating {num_candidates} unique, physically-valid stirring patterns...")
+    with torch.no_grad():
+        # We only use the physics-informed model because we need realistic ideas
+        candidates = model.sample(num_candidates, apply_physics=True)
+
+    # --- Step 2: Evaluate every idea using our simple 'Cooling Score' ---
+    print(f"2. Evaluating all {num_candidates} patterns for their cooling effectiveness...")
+    scores = calculate_cooling_score(candidates[:, 0], candidates[:, 1])
+
+    # --- Step 3: Find the single best and worst patterns from the batch ---
+    print("3. Searching for the champion pattern...")
+    best_score, best_idx = torch.max(scores, dim=0)
+    worst_score, worst_idx = torch.min(scores, dim=0)
+
+    best_pattern = candidates[best_idx].cpu().numpy()
+    worst_pattern = candidates[worst_idx].cpu().numpy()
+    
+    print(f"\n✓ Search complete! Found a pattern with a score of {best_score:.2f}.")
+
+    # --- Step 4: Visualize the result ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # Create a grid for the stream plots
+    y, x = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size))
+    
+    # Plot the worst pattern
+    axes[0].streamplot(x, y, worst_pattern[0], worst_pattern[1], color='red', density=1.5, linewidth=1.5)
+    axes[0].set_title(f"Worst Pattern Found\n(Cooling Score: {worst_score:.2f})", fontsize=16, fontweight='bold')
+    axes[0].set_aspect('equal')
+    axes[0].axis('off')
+    
+    # Plot the best pattern
+    axes[1].streamplot(x, y, best_pattern[0], best_pattern[1], color='green', density=1.5, linewidth=1.5)
+    axes[1].set_title(f"BEST Pattern Found\n(Cooling Score: {best_score:.2f})", fontsize=16, fontweight='bold')
+    axes[1].set_aspect('equal')
+    axes[1].axis('off')
+    
+    plt.suptitle("The AI found the most effective stirring pattern", fontsize=20, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig('practical_app_coffee_cooler.png', dpi=150)
+    plt.show()
+
+# ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
@@ -1269,6 +1362,9 @@ if __name__ == "__main__":
 
     print("Running the Vibration Visualization...")
     visualize_error_as_noise(model)
+
+    # === RUN THE PRACTICAL APPLICATION ===
+    find_optimal_stirring_pattern(model, num_candidates=32)
 
     # Summary
     print("\n" + "="*70)
