@@ -1404,35 +1404,35 @@ if __name__ == "__main__":
     visualize_denoising_trajectory(model)
     
     # 3. Ablation study
-    print("Running Diagnostic 3: Ablation Study...")
-    ablation_study(model, physics_weights=[0.0, 0.1, 0.5, 1.0, 2.0, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10])
+    #print("Running Diagnostic 3: Ablation Study...")
+    #ablation_study(model, physics_weights=[0.0, 0.1, 0.5, 1.0, 2.0, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10])
     
     # 4. Final comparison
-    print("Running Final Comparison...")
-    final_comparison(model, n_samples=4)
+    #print("Running Final Comparison...")
+    #final_comparison(model, n_samples=4)
     
     # 5. NEW INTUITIVE VISUALIZATIONS
-    print("Running Intuitive Flow Visualization...")
-    visualize_flow_fields(model)
+    #print("Running Intuitive Flow Visualization...")
+    #visualize_flow_fields(model)
 
-    print("Running Intuitive Ink Drop Visualization...")
-    visualize_ink_drop_advection(model)
+    #print("Running Intuitive Ink Drop Visualization...")
+    #visualize_ink_drop_advection(model)
 
     # Call the new visualization
-    print("Running the Leaky Bucket Test...")
-    visualize_leaky_bucket(model)
+    #print("Running the Leaky Bucket Test...")
+    #visualize_leaky_bucket(model)
 
-    print("Running the Landscape Visualization...")
-    visualize_error_landscape(model)
+    #print("Running the Landscape Visualization...")
+    #visualize_error_landscape(model)
 
-    print("Running the Landscape Visualization and Vortex...")
-    visualize_vortex_and_error_landscape(model)
+    #print("Running the Landscape Visualization and Vortex...")
+    #visualize_vortex_and_error_landscape(model)
 
-    print("Running the Fog Visualization...")
-    visualize_error_as_fog(model)
+    #print("Running the Fog Visualization...")
+    #isualize_error_as_fog(model)
 
-    print("Running the Vibration Visualization...")
-    visualize_error_as_noise(model)
+    #print("Running the Vibration Visualization...")
+    #visualize_error_as_noise(model)
 
     # === RUN THE PRACTICAL APPLICATION ===
     #find_optimal_stirring_pattern(model, num_candidates=32)
