@@ -1272,7 +1272,7 @@ def find_optimal_stirring_pattern(model, num_candidates=32):
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     
     # Create a grid for the stream plots
-    y, x = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size))
+    x, y = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size), indexing='ij')
     
     # Plot the worst pattern
     axes[0].streamplot(x, y, worst_pattern[0], worst_pattern[1], color='red', density=1.5, linewidth=1.5)
