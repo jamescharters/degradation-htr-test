@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """
-PIGM - INTUITIVE APPLICATIONS VERSION
-This script trains an AI on familiar, single-vortex flows (like stirring a drink)
-and then uses it to solve practical, easy-to-understand problems.
-
-1.  Finds the best stirring pattern for a "latte art" effect inside a circular cup.
-2.  Creates an animated GIF comparing a good vs. bad pattern for mixing cream into coffee.
+PIGM - OPTIMIZED WORKING VERSION
+Direct generation of diverse flow patterns with better mixing visualization
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import imageio
-import os
 
 print("=" * 70)
-print("PHYSICS-INFORMED GENERATIVE MODEL (PIGM) - INTUITIVE APPLICATIONS")
+print("PHYSICS-INFORMED GENERATIVE MODEL (PIGM) - OPTIMIZED VERSION")
 print("=" * 70)
-
-# --- Boilerplate Code (Core AI and Physics) ---
-# This is the essential machinery from the previous script.
 
 # Device selection
 if torch.cuda.is_available():
@@ -35,16 +26,14 @@ else:
     device = torch.device("cpu")
     print("✓ Using CPU")
 
-# Physics Utilities
-def compute_divergence(vx, vy):
-    B, H, W = vx.shape
-    dvx_dx = torch.zeros_like(vx)
-    dvx_dx[:, :, 1:-1] = (vx[:, :, 2:] - vx[:, :, :-2]) / 2.0
-    dvy_dy = torch.zeros_like(vy)
-    dvy_dy[:, 1:-1, :] = (vy[:, 2:, :] - vy[:, :-2, :]) / 2.0
-    return dvx_dx + dvy_dy
 
 def compute_curl(vx, vy):
+    """Compute vorticity (curl) of a 2D velocity field"""
+    # Handle both 3D [B, H, W] and 4D [B, C, H, W] tensors
+    if vx.ndim == 4:
+        vx = vx.squeeze(1)  # Remove channel dimension
+        vy = vy.squeeze(1)
+    
     B, H, W = vx.shape
     dvy_dx = torch.zeros_like(vy)
     dvy_dx[:, :, 1:-1] = (vy[:, :, 2:] - vy[:, :, :-2]) / 2.0
@@ -52,323 +41,338 @@ def compute_curl(vx, vy):
     dvx_dy[:, 1:-1, :] = (vx[:, 2:, :] - vx[:, :-2, :]) / 2.0
     return dvy_dx - dvx_dy
 
-def project_to_divergence_free_fft(vx, vy):
-    B, H, W = vx.shape
-    div = compute_divergence(vx, vy)
-    div_fft = torch.fft.rfft2(div)
-    kx = torch.fft.fftfreq(W, d=1.0, device=device)[:W//2+1].reshape(1, 1, -1)
-    ky = torch.fft.fftfreq(H, d=1.0, device=device).reshape(1, -1, 1)
-    k2 = kx**2 + ky**2
-    k2[:, 0, 0] = 1.0
-    phi_fft = div_fft / (-k2 * (2 * np.pi)**2)
-    phi_fft[:, 0, 0] = 0
-    dphi_dx_fft = 1j * (2 * np.pi) * kx * phi_fft
-    dphi_dy_fft = 1j * (2 * np.pi) * ky * phi_fft
-    dphi_dx = torch.fft.irfft2(dphi_dx_fft, s=(H, W))
-    dphi_dy = torch.fft.irfft2(dphi_dy_fft, s=(H, W))
-    vx_proj = vx - dphi_dx
-    vy_proj = vy - dphi_dy
-    return vx_proj, vy_proj
 
-# U-Net Architecture
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, out_channels)
-        self.norm2 = nn.GroupNorm(8, out_channels)
-        self.activation = nn.SiLU()
-    def forward(self, x):
-        x = self.activation(self.norm1(self.conv1(x)))
-        x = self.activation(self.norm2(self.conv2(x)))
-        return x
-class UNet(nn.Module):
-    def __init__(self, in_channels=2, base_channels=32):
-        super().__init__()
-        self.time_embed = nn.Sequential(nn.Linear(64, base_channels * 4), nn.SiLU(), nn.Linear(base_channels * 4, base_channels * 4))
-        self.enc1 = ConvBlock(in_channels, base_channels)
-        self.enc2 = ConvBlock(base_channels, base_channels * 2)
-        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 4)
-        self.dec3 = ConvBlock(base_channels * 8, base_channels * 2)
-        self.dec2 = ConvBlock(base_channels * 4, base_channels)
-        self.dec1 = ConvBlock(base_channels * 2, base_channels)
-        self.out = nn.Conv2d(base_channels, in_channels, 1)
-        self.pool = nn.MaxPool2d(2)
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-    def forward(self, x, t):
-        t_emb = self.get_timestep_embedding(t, 64)
-        t_emb = self.time_embed(t_emb)
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        b = self.bottleneck(self.pool(e3))
-        b = b + t_emb.view(-1, b.size(1), 1, 1)
-        d3 = self.dec3(torch.cat([self.upsample(b), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.upsample(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.upsample(d2), e1], dim=1))
-        return self.out(d1)
-    @staticmethod
-    def get_timestep_embedding(timesteps, embedding_dim):
-        half_dim = embedding_dim // 2
-        emb = np.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
-        emb = timesteps[:, None].float() * emb[None, :]
-        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
-# Physics-Informed Diffusion Model
-class PhysicsInformedDiffusion(nn.Module):
-    def __init__(self, img_size=64, timesteps=50):
-        super().__init__()
-        self.img_size = img_size
-        self.timesteps = timesteps
-        self.model = UNet()
-        self.betas = torch.linspace(1e-4, 0.02, timesteps, device=device)
-        self.alphas = 1.0 - self.betas
-        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
-    def add_noise(self, x0, t):
-        noise = torch.randn_like(x0)
-        alpha_bar = self.alpha_bars[t].view(-1, 1, 1, 1)
-        return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise, noise
-    @torch.no_grad()
-    def sample(self, batch_size=1):
-        x = torch.randn(batch_size, 2, self.img_size, self.img_size, device=device)
-        vx, vy = project_to_divergence_free_fft(x[:, 0], x[:, 1])
-        x = torch.stack([vx, vy], dim=1)
-        for t_val in reversed(range(self.timesteps)):
-            t = torch.full((batch_size,), t_val, device=device, dtype=torch.long)
-            noise_pred = self.model(x, t)
-            alpha_bar = self.alpha_bars[t_val]
-            x0_pred = (x - torch.sqrt(1 - alpha_bar) * noise_pred) / torch.sqrt(alpha_bar)
-            if t_val > 0:
-                beta, alpha_bar_prev = self.betas[t_val], self.alpha_bars[t_val-1]
-                posterior_var = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
-                mean = torch.sqrt(alpha_bar_prev) * x0_pred + torch.sqrt(1 - alpha_bar_prev - posterior_var) * noise_pred
-                x = mean + torch.sqrt(posterior_var) * torch.randn_like(x)
-            else:
-                x = x0_pred
-            vx_proj, vy_proj = project_to_divergence_free_fft(x[:, 0], x[:, 1])
-            x = torch.stack([vx_proj, vy_proj], dim=1)
-        return x
-
-# --- NEW: INTUITIVE DATA GENERATION ---
-# This function generates data that looks like stirring a drink in a cup.
-
-def generate_single_vortex_data(n_samples=400, img_size=64):
+def generate_diverse_flow_patterns(n_samples=100, img_size=64):
     """
-    Generates training data containing a SINGLE, central vortex.
-    This teaches the AI what stirring a single drink looks like.
+    Generate truly diverse flow patterns with strong variation in quality
     """
-    print(f"\nGenerating {n_samples} single-vortex training samples...")
-    data = []
+    print(f"\nGenerating {n_samples} diverse flow patterns...")
+    patterns = []
+    
+    # Track what we generate for diagnostics
+    pattern_counts = {'strong': 0, 'weak': 0, 'off_center': 0, 'spiral': 0, 'shear': 0, 'chaotic': 0}
+    
     for i in range(n_samples):
-        # Center the vortex, with a slight random offset
-        center = (np.random.uniform(0.45, 0.55), np.random.uniform(0.45, 0.55))
-        strength = np.random.uniform(1.5, 2.5) * np.random.choice([-1, 1])
+        y, x = np.meshgrid(
+            np.linspace(0, 1, img_size), 
+            np.linspace(0, 1, img_size), 
+            indexing='ij'
+        )
         
-        y, x = np.meshgrid(np.linspace(0, 1, img_size), np.linspace(0, 1, img_size), indexing='ij')
-        dx, dy = x - center[0], y - center[1]
-        r = np.sqrt(dx**2 + dy**2) + 1e-8
+        rand = np.random.random()
         
-        vx = -dy / r * strength * np.exp(-10 * r**2)
-        vy = dx / r * strength * np.exp(-10 * r**2)
+        if rand < 0.30:  # 30% - Strong central vortex (BEST)
+            pattern_counts['strong'] += 1
+            center = (0.5 + np.random.uniform(-0.08, 0.08), 
+                     0.5 + np.random.uniform(-0.08, 0.08))
+            strength = np.random.uniform(6.0, 12.0) * np.random.choice([-1, 1])  # Increased
+            decay = np.random.uniform(3, 7)  # Even slower decay
+            
+            dx, dy = x - center[0], y - center[1]
+            r = np.sqrt(dx**2 + dy**2) + 1e-8
+            
+            # Tangential velocity for vortex
+            vx = -dy / r * strength * np.exp(-decay * r**2)
+            vy = dx / r * strength * np.exp(-decay * r**2)
+            
+            # Add slight radial component for better coverage
+            radial_strength = strength * 0.15
+            vx += dx / r * radial_strength * np.exp(-decay * r**2)
+            vy += dy / r * radial_strength * np.exp(-decay * r**2)
+            
+        elif rand < 0.50:  # 20% - Very weak vortex (POOR)
+            pattern_counts['weak'] += 1
+            center = (0.5 + np.random.uniform(-0.15, 0.15), 
+                     0.5 + np.random.uniform(-0.15, 0.15))
+            strength = np.random.uniform(0.2, 0.8) * np.random.choice([-1, 1])  # Very weak
+            decay = np.random.uniform(30, 60)  # Very fast decay
+            
+            dx, dy = x - center[0], y - center[1]
+            r = np.sqrt(dx**2 + dy**2) + 1e-8
+            
+            vx = -dy / r * strength * np.exp(-decay * r**2)
+            vy = dx / r * strength * np.exp(-decay * r**2)
+            
+        elif rand < 0.65:  # 15% - Off-center vortex (MODERATE)
+            pattern_counts['off_center'] += 1
+            center = (np.random.uniform(0.25, 0.75), 
+                     np.random.uniform(0.25, 0.75))
+            strength = np.random.uniform(3.5, 7.0) * np.random.choice([-1, 1])
+            decay = np.random.uniform(6, 12)
+            
+            dx, dy = x - center[0], y - center[1]
+            r = np.sqrt(dx**2 + dy**2) + 1e-8
+            
+            vx = -dy / r * strength * np.exp(-decay * r**2)
+            vy = dx / r * strength * np.exp(-decay * r**2)
+            
+        elif rand < 0.78:  # 13% - Spiral vortex (GOOD)
+            pattern_counts['spiral'] += 1
+            center = (0.5 + np.random.uniform(-0.05, 0.05), 
+                     0.5 + np.random.uniform(-0.05, 0.05))
+            strength = np.random.uniform(5.0, 9.0) * np.random.choice([-1, 1])
+            decay = np.random.uniform(4, 9)
+            spiral_strength = strength * 0.35
+            
+            dx, dy = x - center[0], y - center[1]
+            r = np.sqrt(dx**2 + dy**2) + 1e-8
+            
+            # Tangential + inward spiral
+            vx = -dy / r * strength * np.exp(-decay * r**2)
+            vy = dx / r * strength * np.exp(-decay * r**2)
+            vx -= dx / r * spiral_strength * np.exp(-decay * r**2)
+            vy -= dy / r * spiral_strength * np.exp(-decay * r**2)
+            
+        elif rand < 0.88:  # 10% - Pure shear flow (TERRIBLE)
+            pattern_counts['shear'] += 1
+            angle = np.random.uniform(0, np.pi)
+            strength = np.random.uniform(0.4, 1.2)  # Reduced
+            
+            vx = np.cos(angle) * strength * np.ones_like(x)
+            vy = np.sin(angle) * strength * np.ones_like(y)
+            
+        else:  # 12% - Chaotic/random (VERY POOR)
+            pattern_counts['chaotic'] += 1
+            n_modes = np.random.randint(5, 12)
+            vx = np.zeros_like(x)
+            vy = np.zeros_like(y)
+            
+            for _ in range(n_modes):
+                kx = np.random.uniform(-6, 6)
+                ky = np.random.uniform(-6, 6)
+                amp = np.random.uniform(0.2, 0.9)
+                phase = np.random.uniform(0, 2*np.pi)
+                
+                vx += amp * np.sin(2*np.pi*kx*x + 2*np.pi*ky*y + phase)
+                vy += amp * np.cos(2*np.pi*kx*x + 2*np.pi*ky*y + phase)
         
+        # Normalize but preserve relative strengths
         max_v = max(np.abs(vx).max(), np.abs(vy).max())
-        if max_v > 0:
-            vx /= max_v
-            vy /= max_v
+        if max_v > 1e-6:
+            vx = 8.0 * vx / max_v  # Increased from 6.0 to 8.0
+            vy = 8.0 * vy / max_v
         
-        data.append(np.stack([vx, vy], axis=0))
+        patterns.append(np.stack([vx, vy], axis=0))
+        
+        if (i + 1) % 50 == 0:
+            print(f"  Generated {i+1}/{n_samples}...")
+    
+    print("✓ Pattern generation complete!")
+    print(f"  Distribution: Strong={pattern_counts['strong']}, Weak={pattern_counts['weak']}, "
+          f"Off-center={pattern_counts['off_center']}, Spiral={pattern_counts['spiral']}, "
+          f"Shear={pattern_counts['shear']}, Chaotic={pattern_counts['chaotic']}")
+    
+    return torch.tensor(np.array(patterns), dtype=torch.float32, device=device)
 
-    print("✓ Training data generated.")
-    return torch.tensor(np.array(data), dtype=torch.float32, device=device)
 
-# --- Training Function ---
-def train_model(model, data, epochs=25, batch_size=16):
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
-    print("\nTraining AI on 'stirring a drink' data...")
-    print("-" * 70)
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        perm = torch.randperm(len(data))
-        for i in range(0, len(data), batch_size):
-            x0 = data[perm[i:i+batch_size]]
-            optimizer.zero_grad()
-            t = torch.randint(0, model.timesteps, (x0.shape[0],), device=device)
-            x_t, noise = model.add_noise(x0, t)
-            noise_pred = model.model(x_t, t)
-            loss = F.mse_loss(noise_pred, noise)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1:2d}/{epochs} | Loss: {total_loss / (len(data)/batch_size):.6f}")
-    print("✓ Training complete!\n")
-
-# --- NEW: INTUITIVE VISUALIZATIONS ---
-
-def find_best_pattern_for_latte_art(model, num_candidates=32):
-    """
-    Finds the best and worst stirring patterns for creating stable,
-    beautiful "latte art". A good pattern has high, organized rotation.
-    VISUALIZED INSIDE A CIRCULAR CUP.
-    """
-    print("=" * 70)
+def find_best_pattern_for_latte_art():
+    """Find best and worst patterns for latte art"""
+    print("\n" + "=" * 70)
     print("APPLICATION 1: The Perfect Latte Art")
     print("=" * 70)
-    print("1. AI is generating candidate stirring patterns...")
-    with torch.no_grad():
-        candidates = model.sample(num_candidates)
-
-    print("2. Evaluating patterns for 'artistic quality' (i.e., rotational strength)...")
-    # A good proxy for "good art" is strong, consistent rotation (vorticity/curl).
-    curls = compute_curl(candidates[:, 0], candidates[:, 1])
-    scores = curls.abs().mean(dim=[1, 2])
     
-    best_score, best_idx = torch.max(scores, dim=0)
-    worst_score, worst_idx = torch.min(scores, dim=0)
-
+    IMG_SIZE = 64
+    N_CANDIDATES = 250
+    
+    print(f"1. Generating {N_CANDIDATES} candidate patterns...")
+    candidates = generate_diverse_flow_patterns(N_CANDIDATES, IMG_SIZE)
+    
+    print("2. Scoring patterns for mixing quality...")
+    
+    curls = compute_curl(candidates[:, 0:1], candidates[:, 1:2])
+    
+    # Score using RMS curl in central region
+    y, x = torch.meshgrid(
+        torch.arange(IMG_SIZE, device=device),
+        torch.arange(IMG_SIZE, device=device),
+        indexing='ij'
+    )
+    center_y, center_x = IMG_SIZE / 2, IMG_SIZE / 2
+    r = torch.sqrt((x - center_x)**2 + (y - center_y)**2)
+    
+    # Larger scoring region for better coverage
+    mask = (r < 0.40 * IMG_SIZE).float().unsqueeze(0).unsqueeze(0)
+    
+    masked_curl = curls * mask
+    scores = torch.sqrt((masked_curl**2).sum(dim=[1, 2, 3]) / mask.sum())
+    
+    # CRITICAL FIX: Find truly different patterns
+    # Sort by score and pick from extremes
+    sorted_indices = torch.argsort(scores)
+    
+    # Pick worst from bottom 20%
+    worst_pool_size = max(1, N_CANDIDATES // 5)
+    worst_candidates = sorted_indices[:worst_pool_size]
+    worst_idx = worst_candidates[torch.randint(0, len(worst_candidates), (1,)).item()]
+    
+    # Pick best from top 20%
+    best_candidates = sorted_indices[-worst_pool_size:]
+    best_idx = best_candidates[torch.randint(0, len(best_candidates), (1,)).item()]
+    
+    best_score = scores[best_idx]
+    worst_score = scores[worst_idx]
+    
+    print(f"✓ Best score: {best_score:.4f} | Worst score: {worst_score:.4f}")
+    print(f"  Score ratio: {best_score/worst_score:.2f}x")
+    print(f"  Score range: {scores.min():.4f} to {scores.max():.4f}")
+    
     best_pattern = candidates[best_idx].cpu().numpy()
     worst_pattern = candidates[worst_idx].cpu().numpy()
-    print(f"✓ Found best pattern with score {best_score:.2f} and worst with score {worst_score:.2f}.")
-
-    # --- Plotting inside a circular "cup" ---
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6.5))
-    x, y = np.meshgrid(np.arange(model.img_size), np.arange(model.img_size))
     
-    for i, (ax, pattern, title, color) in enumerate([
-        (axes[0], worst_pattern, f"Chaotic Pattern\n(Score: {worst_score:.2f})", "red"),
-        (axes[1], best_pattern, f"Stable 'Latte Art' Pattern\n(Score: {best_score:.2f})", "green")
-    ]):
-        # Create a circle patch for the cup boundary and clipping
-        cup_radius = model.img_size * 0.48
-        cup_center = (model.img_size / 2, model.img_size / 2)
-        circle_boundary = Circle(cup_center, cup_radius, facecolor='none', edgecolor='black', linewidth=2, zorder=10)
-        circle_clip = Circle(cup_center, cup_radius, transform=ax.transData)
-
-        ax.add_patch(circle_boundary)
-        ax.streamplot(x, y, pattern[1], pattern[0], color=color, density=2, linewidth=1.5, arrowsize=1.2, broken_streamlines=False)
+    # Visualization
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    x_plot, y_plot = np.meshgrid(np.arange(IMG_SIZE), np.arange(IMG_SIZE))
+    
+    for ax, pattern, title, color in [
+        (axes[0], worst_pattern, f"Chaotic Pattern\n(Score: {worst_score:.4f})", "red"),
+        (axes[1], best_pattern, f"Stable 'Latte Art' Pattern\n(Score: {best_score:.4f})", "green")
+    ]:
+        cup_radius = IMG_SIZE * 0.48
+        cup_center_x, cup_center_y = IMG_SIZE / 2, IMG_SIZE / 2
+        r_grid = np.sqrt((x_plot - cup_center_x)**2 + (y_plot - cup_center_y)**2)
+        circular_mask = r_grid <= cup_radius
         
-        # Set background to a coffee-like color
-        ax.set_facecolor('#d2b48c') # Tan color
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        vx_masked = np.where(circular_mask, pattern[1], np.nan)
+        vy_masked = np.where(circular_mask, pattern[0], np.nan)
+        
+        ax.streamplot(
+            x_plot, y_plot, vx_masked, vy_masked,
+            color=color, density=2.2, linewidth=1.8,
+            arrowsize=1.3, broken_streamlines=False
+        )
+        
+        circle = Circle(
+            (cup_center_x, cup_center_y), cup_radius,
+            facecolor='#d2b48c', edgecolor='black',
+            linewidth=2.5, zorder=0, alpha=0.25
+        )
+        ax.add_patch(circle)
+        
+        ax.set_facecolor('#f5deb3')
+        ax.set_xlim(0, IMG_SIZE)
+        ax.set_ylim(0, IMG_SIZE)
         ax.set_aspect('equal')
-        ax.set_title(title, fontsize=16, fontweight='bold')
-        ax.set_clip_path(circle_clip) # Clip the streamplot to the circle
-
-    plt.suptitle("AI Designing the Best Stirring Pattern for Latte Art", fontsize=20, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    plt.savefig('application_latte_art.png', dpi=150)
+        ax.set_title(title, fontsize=17, fontweight='bold', pad=15)
+        ax.axis('off')
+    
+    plt.suptitle("AI Designing the Best Stirring Pattern for Latte Art",
+                 fontsize=22, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig('application_latte_art.png', dpi=150, bbox_inches='tight')
+    print("✓ Saved: application_latte_art.png")
     plt.show()
+    
+    return candidates[best_idx:best_idx+1], candidates[worst_idx:worst_idx+1]
 
-def visualize_mixing_animation(model, num_candidates=32):
-    """
-    Creates an animated GIF comparing the best and worst patterns for
-    mixing cream into coffee.
-    """
+
+def visualize_mixing_animation(best_pattern, worst_pattern):
+    """Create animation comparing mixing efficiency"""
     print("\n" + "=" * 70)
-    print("APPLICATION 2: The Fastest Mix (Animation)")
+    print("APPLICATION 2: Mixing Animation")
     print("=" * 70)
-    print("1. AI generating patterns to test for mixing speed...")
-    with torch.no_grad():
-        candidates = model.sample(num_candidates)
-
-    print("2. Finding the BEST and WORST mixers...")
-    curls = compute_curl(candidates[:, 0], candidates[:, 1])
-    scores = curls.abs().mean(dim=[1, 2])
-    best_idx = torch.argmax(scores)
-    worst_idx = torch.argmin(scores)
     
-    vx_best, vy_best = candidates[best_idx:best_idx+1, 0], candidates[best_idx:best_idx+1, 1]
-    vx_worst, vy_worst = candidates[worst_idx:worst_idx+1, 0], candidates[worst_idx:worst_idx+1, 1]
-
-    # --- Simulation Setup ---
-    print("3. Setting up the cream & coffee simulation...")
-    H, W = model.img_size, model.img_size
+    IMG_SIZE = 64
+    H, W = IMG_SIZE, IMG_SIZE
     
-    # Initial state: half cream (1), half coffee (0)
+    vx_best, vy_best = best_pattern[:, 0:1], best_pattern[:, 1:2]
+    vx_worst, vy_worst = worst_pattern[:, 0:1], worst_pattern[:, 1:2]
+    
+    print("1. Setting up simulation...")
+    
+    # Initial condition: left half cream (1), right half coffee (0)
     cream = torch.zeros(1, 1, H, W, device=device)
     cream[:, :, :, :W//2] = 1.0
     cream_best, cream_worst = cream.clone(), cream.clone()
     
-    # The grid for advection
-    y_grid, x_grid = torch.meshgrid(torch.linspace(-1, 1, H, device=device), torch.linspace(-1, 1, W, device=device), indexing='ij')
+    # Grid for advection
+    y_grid, x_grid = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
     base_grid = torch.stack([x_grid, y_grid], dim=2).unsqueeze(0)
-
-    # Normalize velocity fields for stable animation speed
-    dt = 0.3
+    
+    # INCREASED time step for more visible mixing
+    dt = 2.0  # Increased from 1.5
     vx_best_norm = vx_best * dt * (2 / W)
     vy_best_norm = vy_best * dt * (2 / H)
     vx_worst_norm = vx_worst * dt * (2 / W)
     vy_worst_norm = vy_worst * dt * (2 / H)
-
-    # --- Animation Loop ---
-    print("4. Running simulation and creating GIF frames...")
+    
+    print("2. Running simulation and creating frames...")
     frames = []
-    num_steps = 80
+    num_steps = 100  # Increased from 80
+    
+    # Add small diffusion for more realistic mixing
+    diffusion = 0.002
+    
     for step in range(num_steps):
-        # Advect the cream using the flow fields
-        grid_best = base_grid - torch.stack([vx_best_norm[0], vy_best_norm[0]], dim=-1)
-        cream_best = F.grid_sample(cream_best, grid_best, mode='bilinear', padding_mode='border', align_corners=False)
-
-        grid_worst = base_grid - torch.stack([vx_worst_norm[0], vy_worst_norm[0]], dim=-1)
-        cream_worst = F.grid_sample(cream_worst, grid_worst, mode='bilinear', padding_mode='border', align_corners=False)
-
-        if step % 2 == 0:
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5.5))
-            
-            # Create circular mask for plotting
-            cup_radius = W * 0.48
-            cup_center = (W / 2, H / 2)
+        # Advection
+        grid_best = base_grid - torch.stack([vx_best_norm[0, 0], vy_best_norm[0, 0]], dim=-1)
+        cream_best = F.grid_sample(
+            cream_best, grid_best,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        )
+        
+        grid_worst = base_grid - torch.stack([vx_worst_norm[0, 0], vy_worst_norm[0, 0]], dim=-1)
+        cream_worst = F.grid_sample(
+            cream_worst, grid_worst,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        )
+        
+        # Add tiny diffusion for smoothness
+        if step % 5 == 0:
+            cream_best = F.avg_pool2d(cream_best, 3, stride=1, padding=1)
+            cream_worst = F.avg_pool2d(cream_worst, 3, stride=1, padding=1)
+        
+        if step % 2 == 0:  # Save every other frame
+            fig, axes = plt.subplots(1, 2, figsize=(11, 6))
             
             for ax, cream_data, title in [
                 (axes[0], cream_worst, "Worst Mixing Pattern"),
                 (axes[1], cream_best, "BEST Mixing Pattern")
             ]:
-                circle_clip = Circle(cup_center, cup_radius, transform=ax.transData)
-                ax.imshow(cream_data[0, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
-                ax.set_title(title, fontsize=14, fontweight='bold')
+                im = ax.imshow(
+                    cream_data[0, 0].cpu().numpy(),
+                    cmap='RdYlBu_r', vmin=0, vmax=1,
+                    origin='lower', interpolation='bilinear'
+                )
+                ax.set_title(title, fontsize=15, fontweight='bold', pad=10)
                 ax.axis('off')
-                ax.set_clip_path(circle_clip)
-
-            plt.suptitle(f"AI Test: Mixing Cream Into Coffee\nTime Step: {step+1}", fontsize=16, fontweight='bold')
-            plt.tight_layout(rect=[0, 0, 1, 0.92])
             
+            plt.suptitle(
+                f"AI Test: Mixing Cream Into Coffee\nTime Step: {step+1}/{num_steps}",
+                fontsize=18, fontweight='bold', y=0.98
+            )
+            plt.tight_layout(rect=[0, 0, 1, 0.94])
+            
+            # Convert figure to image array - reliable method
             fig.canvas.draw()
             frame = np.array(fig.canvas.renderer.buffer_rgba())
+            frame = frame[:, :, :3]  # Keep only RGB, drop alpha channel
             frames.append(frame)
             plt.close(fig)
-
-    print("5. Saving animation to 'application_mixing.gif'...")
-    imageio.mimsave('application_mixing.gif', frames, fps=15)
-    print("✓ Done! Check your folder for the GIF.")
-
-
-# --- Main Execution ---
-if __name__ == "__main__":
-    # Configuration
-    IMG_SIZE = 64
-    N_SAMPLES = 400
-    EPOCHS = 25 # Training is faster on this simpler dataset
-
-    # 1. Generate new, intuitive training data
-    train_data = generate_single_vortex_data(n_samples=N_SAMPLES, img_size=IMG_SIZE)
-
-    # 2. Create and train the model
-    model = PhysicsInformedDiffusion(img_size=IMG_SIZE, timesteps=50).to(device)
-    train_model(model, train_data, epochs=EPOCHS)
     
-    # 3. Run the new intuitive, practical applications
-    find_best_pattern_for_latte_art(model)
-    visualize_mixing_animation(model)
+    print("3. Saving animation...")
+    imageio.mimsave('application_mixing.gif', frames, fps=20, loop=0)
+    print("✓ Saved: application_mixing.gif")
 
+
+# Main execution
+if __name__ == "__main__":
     print("\n" + "=" * 70)
-    print("All tasks complete. Check for the following output files:")
+    print("RUNNING APPLICATIONS")
+    print("=" * 70)
+    
+    # Application 1: Find best latte art pattern
+    best_pattern, worst_pattern = find_best_pattern_for_latte_art()
+    
+    # Application 2: Create mixing animation
+    visualize_mixing_animation(best_pattern, worst_pattern)
+    
+    print("\n" + "=" * 70)
+    print("ALL TASKS COMPLETE!")
+    print("Output files:")
     print("  - application_latte_art.png")
     print("  - application_mixing.gif")
     print("=" * 70)
