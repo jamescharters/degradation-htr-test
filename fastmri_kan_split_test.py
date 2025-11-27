@@ -90,43 +90,150 @@ def count_params(model):
 # ==========================================
 # 3. DATA LOADING & SYNTHESIS
 # ==========================================
-def simulate_dipole_phase(H, W, n_dipoles=8):
-    x_space = np.linspace(-1, 1, W)
-    y_space = np.linspace(-1, 1, H)
-    X, Y = np.meshgrid(x_space, y_space) 
-    phase = np.zeros((H, W))
-    for _ in range(n_dipoles):
-        cx, cy = np.random.uniform(-0.8, 0.8), np.random.uniform(-0.8, 0.8)
-        radius = np.random.uniform(0.05, 0.15)
-        strength = np.random.choice([-1, 1]) * np.random.uniform(10, 25) 
-        r2 = (X - cx)**2 + (Y - cy)**2
-        dipole = strength * (1 / (1 + r2/(radius**2)))
-        phase += dipole
-    return phase
+def simulate_dipole_phase(H, W, n_dipoles=8,
+                          strength_range=(10.0, 25.0),
+                          radius_range=(0.05, 0.15),
+                          centre_range=(-0.8, 0.8),
+                          rng=None):
+    """
+    Simulate a sum of dipole-like local phase perturbations over a 2D grid.
+    This approximates local susceptibility effects (veins, tissue interfaces, etc).
 
-def load_data(h5_path, slice_idx):
-    if not os.path.exists(h5_path):
-        print(f"⚠️ FILE NOT FOUND: {h5_path}. Using Dummy.")
-        H, W = 320, 320
-        magnitude = np.random.uniform(0,1, (H,W))
-    else:
-        with h5py.File(h5_path, 'r') as hf:
-            kspace = hf['kspace'][slice_idx]
-        img_complex = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(kspace)))
-        magnitude = np.abs(img_complex)
-        magnitude = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min())
+    Parameters
+    ----------
+    H, W : int
+        Image height and width.
+    n_dipoles : int
+        Number of dipole-like sources to place.
+    strength_range : (float, float)
+        Range of absolute dipole strengths (in radians).
+    radius_range : (float, float)
+        Range of dipole "radius" (in normalised coordinates).
+    centre_range : (float, float)
+        Range for random dipole centres in normalised coords (X, Y in [-1,1]).
+    rng : np.random.Generator or None
+        Optional random number generator for reproducibility.
+
+    Returns
+    -------
+    phase_local : (H, W) ndarray
+        Local phase contribution from all dipoles (unwrapped).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Normalised coordinate grid in [-1, 1]
+    x_space = np.linspace(-1.0, 1.0, W)
+    y_space = np.linspace(-1.0, 1.0, H)
+    X, Y = np.meshgrid(x_space, y_space)
+
+    phase_local = np.zeros((H, W), dtype=np.float32)
+
+    for _ in range(n_dipoles):
+        cx = rng.uniform(centre_range[0], centre_range[1])
+        cy = rng.uniform(centre_range[0], centre_range[1])
+        radius = rng.uniform(radius_range[0], radius_range[1])
+        strength = rng.choice([-1.0, 1.0]) * rng.uniform(strength_range[0], strength_range[1])
+
+        r2 = (X - cx) ** 2 + (Y - cy) ** 2
+        # Simple 1 / (1 + r^2/R^2) profile – not physically exact, but dipole-like
+        dipole = strength * (1.0 / (1.0 + r2 / (radius ** 2)))
+        phase_local += dipole.astype(np.float32)
+
+    return phase_local
+
+def load_data(h5_path, slice_idx,
+              n_dipoles=6,
+              bg_coeff_range=(-5.0, 5.0),
+              noise_sigma=0.02,
+              rng=None):
+    """
+    Load a single fastMRI slice and generate a realistic synthetic phase field.
+
+    - Magnitude comes from the actual fastMRI inverse FFT.
+    - Phase is simulated as:
+        phase_true = smooth_background + local_dipoles
+      then converted to a noisy, wrapped phase via complex Gaussian noise.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the fastMRI HDF5 file.
+    slice_idx : int
+        Index of the slice to load.
+    n_dipoles : int
+        Number of local dipole-like sources to add.
+    bg_coeff_range : (float, float)
+        Range for random polynomial background phase coefficients (in radians).
+    noise_sigma : float
+        Standard deviation of complex Gaussian noise (relative to magnitude scale).
+    rng : np.random.Generator or None
+        Optional random number generator for reproducibility.
+
+    Returns
+    -------
+    magnitude : (H, W) ndarray
+        Normalised magnitude image from fastMRI.
+    phase_true : (H, W) ndarray
+        Synthetic unwrapped phase (background + dipoles).
+    phase_wrapped : (H, W) ndarray
+        Noisy, wrapped phase as would be observed by the scanner.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # ---- 1. Load k-space and compute complex image ----
+    with h5py.File(h5_path, 'r') as hf:
+        kspace = hf['kspace'][slice_idx]  # assumes single-coil or one coil already selected
+
+    img_complex = np.fft.fftshift(
+        np.fft.ifft2(
+            np.fft.ifftshift(kspace)
+        )
+    )
+
+    magnitude = np.abs(img_complex).astype(np.float32)
+
+    # Normalise magnitude to [0, 1] (avoid divide-by-zero)
+    mag_min = magnitude.min()
+    mag_max = magnitude.max()
+    magnitude = (magnitude - mag_min) / (mag_max - mag_min + 1e-8)
 
     H, W = magnitude.shape
-    
-    # Dipoles + Noise
-    phase_true = simulate_dipole_phase(H, W, n_dipoles=6)
-    phase_noise = np.random.normal(0, NOISE_LEVEL, (H, W))
-    
-    # Wrap
-    img_new = magnitude * np.exp(1j * (phase_true + phase_noise))
-    phase_wrapped = np.angle(img_new)
-    
+
+    # ---- 2. Smooth background phase (B0-like field) ----
+    x = np.linspace(-1.0, 1.0, W, dtype=np.float32)
+    y = np.linspace(-1.0, 1.0, H, dtype=np.float32)
+    X, Y = np.meshgrid(x, y)
+
+    # Random quadratic background: a0 + a1 x + a2 y + a3 x^2 + a4 y^2
+    a0, a1, a2, a3, a4 = rng.uniform(bg_coeff_range[0], bg_coeff_range[1], size=5)
+    phase_bg = (a0
+                + a1 * X
+                + a2 * Y
+                + a3 * X ** 2
+                + a4 * Y ** 2).astype(np.float32)
+
+    # ---- 3. Local dipole-like phase ----
+    phase_local = simulate_dipole_phase(H, W, n_dipoles=n_dipoles, rng=rng)
+
+    # Total unwrapped phase
+    phase_true = phase_bg + phase_local  # (H, W), float32
+
+    # ---- 4. Build noisy complex image and extract wrapped phase ----
+    img_ideal = magnitude * np.exp(1j * phase_true)
+
+    # Complex Gaussian noise (same sigma for real and imag parts)
+    noise_real = rng.normal(0.0, noise_sigma, img_ideal.shape)
+    noise_imag = rng.normal(0.0, noise_sigma, img_ideal.shape)
+    noise_complex = noise_real + 1j * noise_imag
+
+    img_noisy = img_ideal + noise_complex
+
+    phase_wrapped = np.angle(img_noisy).astype(np.float32)
+
     return magnitude, phase_true, phase_wrapped
+
 
 def extract_patches(phase_wrapped, phase_true, magnitude):
     H, W = phase_wrapped.shape
