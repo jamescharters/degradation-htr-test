@@ -95,6 +95,9 @@ def simulate_dipole_phase(H, W, n_dipoles=8,
                           radius_range=(0.05, 0.15),
                           centre_range=(-0.8, 0.8),
                           rng=None):
+    
+    # See this function as defined in https://chatgpt.com/g/g-p-67c2f03cefa08191a65e9c79cc3eaea3-james/c/692841f0-f354-8320-b023-aa80ffd9634b
+    
     """
     Simulate a sum of dipole-like local phase perturbations over a 2D grid.
     This approximates local susceptibility effects (veins, tissue interfaces, etc).
@@ -147,6 +150,9 @@ def load_data(h5_path, slice_idx,
               bg_coeff_range=(-5.0, 5.0),
               noise_sigma=0.02,
               rng=None):
+    
+    # See this function as defined in https://chatgpt.com/g/g-p-67c2f03cefa08191a65e9c79cc3eaea3-james/c/692841f0-f354-8320-b023-aa80ffd9634b
+
     """
     Load a single fastMRI slice and generate a realistic synthetic phase field.
 
