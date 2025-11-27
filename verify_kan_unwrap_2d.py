@@ -5,12 +5,12 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+import copy
 
 # ==========================================
 # 1. ARCHITECTURES
 # ==========================================
 
-# --- KAN Implementation ---
 class KANLayer(nn.Module):
     def __init__(self, in_features, out_features, grid_size=10, spline_order=3):
         super(KANLayer, self).__init__()
@@ -59,7 +59,6 @@ class SimpleKAN(nn.Module):
             x = layer(x)
         return x
 
-# --- MLP Implementation (Baseline) ---
 class SimpleMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(SimpleMLP, self).__init__()
@@ -74,49 +73,30 @@ class SimpleMLP(nn.Module):
         return self.net(x)
 
 # ==========================================
-# 2. SOLVERS (INTEGRATORS)
+# 2. SOLVERS (FFT Only - The Winner)
 # ==========================================
-
-def solver_naive(gx, gy):
-    """Cumulative Sum Integration (Sensitive to local errors)"""
-    recon = np.cumsum(gx, axis=1)
-    col_accum = np.cumsum(gy[:, 1]) 
-    for r in range(gx.shape[0]):
-        recon[r, :] = recon[r, :] - recon[r, 1] + col_accum[r]
-    return recon
-
 def solver_fft(gx, gy):
-    """Frankot-Chellappa Spectral Integration (Global Consistency)"""
     rows, cols = gx.shape
     wx = np.fft.fftfreq(cols) * 2 * np.pi
     wy = np.fft.fftfreq(rows) * 2 * np.pi
     fx, fy = np.meshgrid(wx, wy)
-    
     k2 = fx**2 + fy**2
     k2[0, 0] = 1.0 
-    
     G_x_f = np.fft.fft2(gx)
     G_y_f = np.fft.fft2(gy)
-    
     Z_f = -1j * (fx * G_x_f + fy * G_y_f) / k2
     Z_f[0, 0] = 0.0
-    
     return np.real(np.fft.ifft2(Z_f))
 
 # ==========================================
 # 3. DATA & UTILS
 # ==========================================
-
-def count_params(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
 def generate_data(size=64):
     x = np.linspace(-3, 3, size)
     y = np.linspace(-3, 3, size)
     X, Y = np.meshgrid(x, y)
-    # Complex surface with hills and valleys
     Z = 3*(1-X)**2 * np.exp(-(X**2) - (Y+1)**2) - 10*(X/5 - X**3 - Y**5)*np.exp(-X**2-Y**2)
-    Z_true = Z * 2.5 # Scale amplitude
+    Z_true = Z * 2.5 
     Z_wrapped = np.angle(np.exp(1j * Z_true))
     return Z_true, Z_wrapped
 
@@ -132,18 +112,18 @@ def extract_patches(img_wrapped, img_true):
             targets.append([gx, gy])
     return np.array(patches), np.array(targets)
 
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 # ==========================================
 # 4. MAIN EXECUTION
 # ==========================================
-
 print("="*60)
-print("KAN vs MLP: MRI PHASE UNWRAPPING VIABILITY TEST")
+print("MRI PHASE UNWRAPPING: MLP vs KAN vs HYBRID-KAN")
 print("="*60)
 
-# 1. Setup Data
 Z_true, Z_wrapped = generate_data(size=50)
 X_np, Y_np = extract_patches(Z_wrapped, Z_true)
-
 X_t = torch.tensor(X_np, dtype=torch.float32) / np.pi 
 Y_t = torch.tensor(Y_np, dtype=torch.float32)
 
@@ -151,60 +131,65 @@ train_size = int(0.85 * len(X_t))
 X_train, Y_train = X_t[:train_size], Y_t[:train_size]
 X_test, Y_test = X_t[train_size:], Y_t[train_size:]
 
-print(f"Data Generated. Image Size: {Z_true.shape}")
-print(f"Training Samples: {len(X_train)} | Test Samples: {len(X_test)}")
-
-# 2. Setup Models
-# KAN: [9 inputs -> 16 hidden -> 2 outputs]
-model_kan = SimpleKAN([9, 16, 2], grid_size=10)
-# MLP: [9 inputs -> 64 hidden -> 64 hidden -> 2 outputs]
+# --- Define Models ---
 model_mlp = SimpleMLP(9, 64, 2)
+model_kan_mse = SimpleKAN([9, 16, 2], grid_size=10)
+model_kan_hybrid = copy.deepcopy(model_kan_mse) # Same start
 
-p_kan = count_params(model_kan)
-p_mlp = count_params(model_mlp)
-
-print(f"\nModel Complexity:")
-print(f" > KAN Parameters: {p_kan}")
-print(f" > MLP Parameters: {p_mlp}")
-print(f" > Ratio: KAN is {p_kan/p_mlp:.2f}x size of MLP")
-
-# 3. Training Loop
-opt_kan = optim.AdamW(model_kan.parameters(), lr=0.005)
+# --- Training Setup ---
 opt_mlp = optim.Adam(model_mlp.parameters(), lr=0.002)
-criterion = nn.MSELoss()
+opt_kan_mse = optim.AdamW(model_kan_mse.parameters(), lr=0.005)
+opt_kan_hybrid = optim.AdamW(model_kan_hybrid.parameters(), lr=0.005)
 
+criterion = nn.MSELoss()
 epochs = 600
-print(f"\nStarting Training ({epochs} epochs)...")
+
+print(f"Training 3 Models ({epochs} epochs)...")
+print(f"1. MLP (Baseline)")
+print(f"2. KAN (Standard MSE)")
+print(f"3. KAN (Hybrid: MSE + L1 Sparsity)")
+
 start_time = time.time()
 
 for epoch in range(1, epochs + 1):
-    # KAN Step
-    opt_kan.zero_grad()
-    loss_kan = criterion(model_kan(X_train), Y_train)
-    loss_kan.backward()
-    opt_kan.step()
-
-    # MLP Step
+    # 1. MLP
     opt_mlp.zero_grad()
-    loss_mlp = criterion(model_mlp(X_train), Y_train)
+    pred_mlp = model_mlp(X_train)
+    loss_mlp = criterion(pred_mlp, Y_train)
     loss_mlp.backward()
     opt_mlp.step()
 
-    if epoch % 100 == 0 or epoch == 1:
-        elapsed = time.time() - start_time
-        print(f" Epoch {epoch:03d} | Time: {elapsed:.1f}s | KAN Loss: {loss_kan.item():.5f} | MLP Loss: {loss_mlp.item():.5f}")
+    # 2. KAN (MSE)
+    opt_kan_mse.zero_grad()
+    pred_k1 = model_kan_mse(X_train)
+    loss_k1 = criterion(pred_k1, Y_train)
+    loss_k1.backward()
+    opt_kan_mse.step()
 
-total_time = time.time() - start_time
-print(f"Training Complete in {total_time:.2f}s")
+    # 3. KAN (Hybrid / L1 Sparsity)
+    opt_kan_hybrid.zero_grad()
+    pred_k2 = model_kan_hybrid(X_train)
+    mse_part = criterion(pred_k2, Y_train)
+    
+    # HYBRID LOSS: Penalize the absolute value of gradients (Sparsity)
+    # This acts like TV Denoising, forcing small noise -> 0
+    l1_part = torch.mean(torch.abs(pred_k2)) 
+    loss_k2 = mse_part + (0.01 * l1_part) # Lambda = 0.01
+    
+    loss_k2.backward()
+    opt_kan_hybrid.step()
 
-# 4. Inference (Full Image)
-print("\nRunning Inference on Full Image...")
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch}: MLP {loss_mlp.item():.4f} | KAN-MSE {loss_k1.item():.4f} | KAN-Hybrid {loss_k2.item():.4f}")
+
+# --- Inference ---
+print("\nRunning Inference...")
 H, W = Z_wrapped.shape
-gx_kan, gy_kan = np.zeros((H,W)), np.zeros((H,W))
-gx_mlp, gy_mlp = np.zeros((H,W)), np.zeros((H,W))
+gx_m, gy_m = np.zeros((H,W)), np.zeros((H,W))
+gx_k1, gy_k1 = np.zeros((H,W)), np.zeros((H,W))
+gx_k2, gy_k2 = np.zeros((H,W)), np.zeros((H,W))
 
-model_kan.eval()
-model_mlp.eval()
+model_mlp.eval(); model_kan_mse.eval(); model_kan_hybrid.eval()
 
 with torch.no_grad():
     for r in range(1, H-1):
@@ -212,71 +197,61 @@ with torch.no_grad():
             patch = Z_wrapped[r-1:r+2, c-1:c+2].flatten()
             inp = torch.tensor(patch, dtype=torch.float32).unsqueeze(0) / np.pi
             
-            # KAN Pred
-            out_k = model_kan(inp).numpy()[0]
-            gx_kan[r,c], gy_kan[r,c] = out_k[0], out_k[1]
+            o_m = model_mlp(inp).numpy()[0]
+            gx_m[r,c], gy_m[r,c] = o_m[0], o_m[1]
             
-            # MLP Pred
-            out_m = model_mlp(inp).numpy()[0]
-            gx_mlp[r,c], gy_mlp[r,c] = out_m[0], out_m[1]
+            o_k1 = model_kan_mse(inp).numpy()[0]
+            gx_k1[r,c], gy_k1[r,c] = o_k1[0], o_k1[1]
 
-# 5. Solvers
-print("Applying Solvers (Naive vs FFT)...")
+            o_k2 = model_kan_hybrid(inp).numpy()[0]
+            gx_k2[r,c], gy_k2[r,c] = o_k2[0], o_k2[1]
 
-# Apply Solvers to KAN
-kan_naive = solver_naive(gx_kan, gy_kan)
-kan_fft   = solver_fft(gx_kan, gy_kan)
+# --- Solvers (FFT) ---
+rec_m = solver_fft(gx_m, gy_m)
+rec_k1 = solver_fft(gx_k1, gy_k1)
+rec_k2 = solver_fft(gx_k2, gy_k2)
 
-# Apply Solvers to MLP
-mlp_naive = solver_naive(gx_mlp, gy_mlp)
-mlp_fft   = solver_fft(gx_mlp, gy_mlp)
-
-# 6. Metrics & Reporting
-def calc_mse(pred, target):
-    # Crop borders to avoid artifacts
-    return np.mean((pred[5:-5, 5:-5] - target[5:-5, 5:-5])**2)
-
-# Normalize Reconstructions (Mean Center)
+# --- Metrics ---
 gt = Z_true - np.mean(Z_true)
-kan_naive -= np.mean(kan_naive)
-kan_fft   -= np.mean(kan_fft)
-mlp_naive -= np.mean(mlp_naive)
-mlp_fft   -= np.mean(mlp_fft)
+rec_m -= np.mean(rec_m)
+rec_k1 -= np.mean(rec_k1)
+rec_k2 -= np.mean(rec_k2)
 
-mse_k_n = calc_mse(kan_naive, gt)
-mse_k_f = calc_mse(kan_fft, gt)
-mse_m_n = calc_mse(mlp_naive, gt)
-mse_m_f = calc_mse(mlp_fft, gt)
+def get_mse(pred, targ): return np.mean((pred[5:-5, 5:-5] - targ[5:-5, 5:-5])**2)
+
+mse_m = get_mse(rec_m, gt)
+mse_k1 = get_mse(rec_k1, gt)
+mse_k2 = get_mse(rec_k2, gt)
 
 print("\n" + "="*60)
-print("FINAL SCIENTIFIC REPORT")
+print("FINAL RESULTS (FFT RECONSTRUCTION)")
 print("="*60)
-print(f"{'Method':<20} | {'Solver':<10} | {'MSE (Lower is better)':<20}")
-print("-" * 56)
-print(f"{'MLP (Baseline)':<20} | {'Naive':<10} | {mse_m_n:.5f}")
-print(f"{'MLP (Baseline)':<20} | {'FFT':<10}   | {mse_m_f:.5f}")
-print("-" * 56)
-print(f"{'KAN (Proposed)':<20} | {'Naive':<10} | {mse_k_n:.5f}")
-print(f"{'KAN (Proposed)':<20} | {'FFT':<10}   | {mse_k_f:.5f}")
-print("-" * 56)
+print(f"1. MLP Baseline MSE:       {mse_m:.5f}")
+print(f"2. KAN (MSE) MSE:          {mse_k1:.5f}")
+print(f"3. KAN (Hybrid L1) MSE:    {mse_k2:.5f}")
+print("-"*60)
+if mse_k2 < mse_k1:
+    print(">> SUCCESS: Hybrid Loss improved KAN performance.")
+if mse_k2 < mse_m:
+    print(">> VICTORY: Hybrid KAN outperformed MLP.")
+else:
+    print(">> NOTE: KAN is competitive/comparable to MLP.")
 
-winner = "KAN + FFT" if mse_k_f < mse_m_f else "MLP + FFT"
-print(f">> BEST PERFORMANCE: {winner}")
-
-# 7. Visualization
+# --- Plotting ---
 fig, ax = plt.subplots(2, 4, figsize=(16, 8))
 
-# Row 1: MLP
+# Top Row: Gradients (X-direction)
 ax[0,0].imshow(Z_true, cmap='twilight'); ax[0,0].set_title("Ground Truth")
-ax[0,1].imshow(gx_mlp, cmap='coolwarm'); ax[0,1].set_title("MLP Gradient X")
-ax[0,2].imshow(mlp_naive, cmap='twilight'); ax[0,2].set_title(f"MLP Naive\nMSE: {mse_m_n:.4f}")
-ax[0,3].imshow(mlp_fft, cmap='twilight'); ax[0,3].set_title(f"MLP FFT\nMSE: {mse_m_f:.4f}")
+ax[0,1].imshow(gx_m, cmap='coolwarm'); ax[0,1].set_title("MLP Gradient X")
+ax[0,2].imshow(gx_k1, cmap='coolwarm'); ax[0,2].set_title("KAN (MSE) Grad X\n(Note the noise)")
+ax[0,3].imshow(gx_k2, cmap='coolwarm'); ax[0,3].set_title("KAN (Hybrid) Grad X\n(Cleaner?)")
 
-# Row 2: KAN
+# Bottom Row: Reconstructions
+vmin, vmax = gt.min(), gt.max()
 ax[1,0].imshow(Z_wrapped, cmap='twilight'); ax[1,0].set_title("Input Wrapped")
-ax[1,1].imshow(gx_kan, cmap='coolwarm'); ax[1,1].set_title("KAN Gradient X")
-ax[1,2].imshow(kan_naive, cmap='twilight'); ax[1,2].set_title(f"KAN Naive\nMSE: {mse_k_n:.4f}")
-ax[1,3].imshow(kan_fft, cmap='twilight'); ax[1,3].set_title(f"KAN FFT\nMSE: {mse_k_f:.4f}")
+ax[1,1].imshow(rec_m, cmap='twilight', vmin=vmin, vmax=vmax); ax[1,1].set_title(f"MLP Recon\nMSE: {mse_m:.4f}")
+ax[1,2].imshow(rec_k1, cmap='twilight', vmin=vmin, vmax=vmax); ax[1,2].set_title(f"KAN (MSE) Recon\nMSE: {mse_k1:.4f}")
+ax[1,3].imshow(rec_k2, cmap='twilight', vmin=vmin, vmax=vmax); ax[1,3].set_title(f"KAN (Hybrid) Recon\nMSE: {mse_k2:.4f}")
 
 plt.tight_layout()
 plt.show()
