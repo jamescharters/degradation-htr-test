@@ -30,6 +30,8 @@ dependencies = [
     "pygrappa>=0.26.3",
     "phantominator>=0.7.0",
     "sigpy>=0.1.27",
+    "torch-geometric>=2.7.0",
+    "wfdb>=4.3.0",
 ]
 
 [project.optional-dependencies]
