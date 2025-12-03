@@ -1,0 +1,435 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+
+# ==========================================
+# 1. NETWORK & ATTENTION MODULES
+# ==========================================
+
+class BayesianChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=4):
+        super(BayesianChannelAttention, self).__init__()
+        reduced_channels = max(in_channels // reduction_ratio, 4)
+        
+        self.fc_shared = nn.Sequential(
+            nn.Conv2d(in_channels, reduced_channels, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        self.fc_mu = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, bias=False)
+        self.fc_var = nn.Conv2d(reduced_channels, in_channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        avg_pool = F.adaptive_avg_pool2d(x, 1)
+        shared_out = self.fc_shared(avg_pool)
+        
+        mu = self.fc_mu(shared_out)
+        log_var = self.fc_var(shared_out)
+        std = torch.exp(0.5 * log_var)
+        
+        if self.training:
+            epsilon = torch.randn_like(std)
+            z = mu + std * epsilon
+        else:
+            z = mu 
+            
+        att_weights = torch.sigmoid(z)
+        out_features = x + (x * att_weights)
+        variance = torch.exp(log_var)
+        
+        return out_features, variance, mu, log_var
+
+class UncertaintyGuidedPixelAttention(nn.Module):
+    def __init__(self, in_channels, beta=10):
+        super(UncertaintyGuidedPixelAttention, self).__init__()
+        self.beta = beta
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels // 2, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, variance):
+        w_sigma = torch.exp(-self.beta * variance)
+        features_tilde = x * w_sigma
+        
+        pa = self.conv1(features_tilde)
+        pa = self.relu(pa)
+        pa = self.conv2(pa)
+        att_map = self.sigmoid(pa)
+        
+        output = features_tilde + (features_tilde * att_map)
+        return output
+
+class MalariaClassificationNet(nn.Module):
+    def __init__(self, num_classes=2):
+        super(MalariaClassificationNet, self).__init__()
+        
+        # Feature Extraction
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2) 
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
+        
+        self.bca = BayesianChannelAttention(in_channels=64)
+        self.ugpa = UncertaintyGuidedPixelAttention(in_channels=64, beta=10)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(64 * 5 * 5, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(512, 50),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(50, num_classes)
+        )
+
+    def forward(self, x):
+        f1 = self.block1(x)
+        f2 = self.block2(f1)
+        features = self.block3(f2)
+        
+        bca_features, variance, mu, log_var = self.bca(features)
+        final_features = self.ugpa(bca_features, variance)
+        
+        flat = final_features.view(final_features.size(0), -1)
+        logits = self.classifier(flat)
+        
+        return logits, mu, log_var
+
+def elbo_loss(logits, targets, mu, log_var, kl_weight=0.0001):
+    ce_loss = F.cross_entropy(logits, targets)
+    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    kl_loss = kl_loss / logits.size(0)
+    return ce_loss + (kl_weight * kl_loss)
+
+# ==========================================
+# 2. DATASET (Synthetic for Testing)
+# ==========================================
+# class SyntheticMalariaDataset(Dataset):
+#     def __init__(self, num_samples=500):
+#         self.num_samples = num_samples
+#         self.data = []
+#         self.targets = []
+        
+#         for _ in range(num_samples):
+#             # 1. Base Noise
+#             img = torch.randn(3, 44, 44)
+            
+#             # 2. Label
+#             label = np.random.randint(0, 2)
+            
+#             # 3. Inject Signal: A "Parasite" Blob
+#             # We add a bright spot in the center for Label 1.
+#             # BatchNorm can't remove this because it varies spatially.
+#             if label == 1:
+#                 # Add intensity to a 10x10 patch in the middle
+#                 img[0, 17:27, 17:27] += 5.0 
+            
+#             self.data.append(img)
+#             self.targets.append(label)
+
+#         self.data = torch.stack(self.data)
+#         self.targets = torch.tensor(self.targets)
+
+#     def __len__(self):
+#         return self.num_samples
+
+#     def __getitem__(self, idx):
+#         return self.data[idx], self.targets[idx], idx
+
+class SyntheticMalariaDataset(Dataset):
+    def __init__(self, num_samples=500):
+        self.num_samples = num_samples
+        self.data = []
+        self.targets = []
+        self.size = 44
+        
+        # Pre-compute Circular Mask
+        Y, X = torch.meshgrid(torch.arange(self.size), torch.arange(self.size))
+        center = self.size / 2 - 0.5
+        dist_from_center = torch.sqrt((X - center)**2 + (Y - center)**2)
+        self.mask = (dist_from_center <= 22).float().unsqueeze(0)
+
+        for _ in range(num_samples):
+            # 1. BASE TEXTURE (Cloudy Pink)
+            cloud_noise = torch.randn(1, 3, 11, 11)
+            cloud_noise = F.interpolate(cloud_noise, size=(self.size, self.size), mode='bilinear', align_corners=False)
+            cloud_noise = cloud_noise.squeeze(0)
+            
+            # Base color: Light Purple
+            base_color = torch.tensor([0.8, 0.6, 0.8]).view(3, 1, 1)
+            img = base_color + (0.1 * cloud_noise)
+            
+            label = np.random.randint(0, 2)
+            
+            Y_grid, X_grid = torch.meshgrid(torch.arange(self.size), torch.arange(self.size))
+
+            if label == 1:
+                # === PARASITE GENERATION ===
+                # Logic: Small, Sharp, Dark, Variable Size
+                
+                cx = np.random.randint(14, 30)
+                cy = np.random.randint(14, 30)
+                
+                # Randomize Size (Sigma) - matches paper variability
+                sigma_x = np.random.uniform(1.5, 4.0) 
+                sigma_y = np.random.uniform(1.5, 4.0) # Different sigmas = Oval shape
+                
+                # Calculate Gaussian Blob
+                # exponent = - ((x-cx)^2 / 2sx^2 + (y-cy)^2 / 2sy^2)
+                exponent = -(((X_grid - cx)**2) / (2 * sigma_x**2) + ((Y_grid - cy)**2) / (2 * sigma_y**2))
+                spot = torch.exp(exponent)
+                
+                # Randomize Intensity (how much stain it absorbed)
+                intensity = np.random.uniform(0.4, 0.8)
+                
+                # Subtract color (Dark Purple = remove Green/Red/Blue)
+                img[0] -= (intensity * 0.6) * spot # Red
+                img[1] -= (intensity * 0.9) * spot # Green (Main component of purple darkness)
+                img[2] -= (intensity * 0.6) * spot # Blue
+                
+            else:
+                # === NON-PARASITE ===
+                # Logic: Large, Faint, Diffuse (Artifacts)
+                
+                # 50% chance to have a "distractor" blob (WBC or stain artifact)
+                if np.random.rand() > 0.5:
+                    cx = np.random.randint(10, 34)
+                    cy = np.random.randint(10, 34)
+                    
+                    # Much larger size
+                    sigma = np.random.uniform(5.0, 10.0)
+                    
+                    dist_sq = (X_grid - cx)**2 + (Y_grid - cy)**2
+                    blob = torch.exp(-0.5 * dist_sq / (sigma**2))
+                    
+                    # Very faint intensity
+                    img -= 0.15 * blob
+
+            # Apply Mask & Clamp
+            img = img * self.mask
+            img = torch.clamp(img, 0, 1)
+            
+            self.data.append(img)
+            self.targets.append(label)
+
+        self.data = torch.stack(self.data)
+        self.targets = torch.tensor(self.targets)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.targets[idx], idx
+
+# ==========================================
+# 3. TRAINING & ANALYSIS
+# ==========================================
+def train_model(model, train_loader, device, num_epochs=50):
+    # Switch to Adam for faster convergence on toy problems
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    kl_weight = 0.0
+    
+    print(f"Starting training on {device}...")
+    model.train()
+    
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        # Increase KL weight slowly
+        kl_weight = min(0.01, kl_weight + 0.002) 
+
+        for inputs, labels, _ in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            logits, mu, log_var = model(inputs)
+            
+            # Loss
+            loss = elbo_loss(logits, labels, mu, log_var, kl_weight=kl_weight)
+            
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+        avg_loss = running_loss / len(train_loader)
+        acc = 100 * correct / total
+        print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+        
+    return model
+
+
+# 
+# Visualisation
+#
+
+def visualize_samples(dataset, num_samples=5):
+    """
+    Plots a grid: Top row = Non-Parasites (0), Bottom row = Parasites (1)
+    """
+    # containers
+    zeros = []
+    ones = []
+    
+    # Randomly search dataset until we have enough of both
+    # (Inefficient for huge datasets, but fine for MPhil scale)
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    
+    for idx in indices:
+        img, label, _ = dataset[idx]
+        if label == 0 and len(zeros) < num_samples:
+            zeros.append(img)
+        elif label == 1 and len(ones) < num_samples:
+            ones.append(img)
+        
+        if len(zeros) == num_samples and len(ones) == num_samples:
+            break
+    
+    # Plotting
+    fig, axes = plt.subplots(2, num_samples, figsize=(15, 6))
+    fig.suptitle("Random Training Samples (Top: Healthy, Bottom: Parasite)", fontsize=16)
+    
+    for i in range(num_samples):
+        # Class 0
+        ax = axes[0, i]
+        img_0 = zeros[i].permute(1, 2, 0).cpu().numpy() # CHW -> HWC
+        # Normalize for display if needed (assuming 0-1 range here)
+        img_0 = (img_0 - img_0.min()) / (img_0.max() - img_0.min())
+        ax.imshow(img_0)
+        ax.axis('off')
+        if i == 0: ax.set_ylabel("Non-Parasite", fontsize=14)
+
+        # Class 1
+        ax = axes[1, i]
+        img_1 = ones[i].permute(1, 2, 0).cpu().numpy()
+        img_1 = (img_1 - img_1.min()) / (img_1.max() - img_1.min())
+        ax.imshow(img_1)
+        ax.axis('off')
+        if i == 0: ax.set_ylabel("Parasite", fontsize=14)
+        
+    plt.tight_layout()
+    plt.show()
+
+def visualize_top_uncertain(dataset, uncertainty_records, num_show=5):
+    """
+    Plots the images that confused the model the most.
+    """
+    # Get top N records
+    top_records = uncertainty_records[:num_show]
+    
+    fig, axes = plt.subplots(1, num_show, figsize=(15, 4))
+    fig.suptitle(f"Top {num_show} Most Uncertain Images (High Variance)", fontsize=16)
+    
+    for i, record in enumerate(top_records):
+        idx = record['index']
+        unc = record['uncertainty_score']
+        true_lbl = record['true_label']
+        pred_lbl = record['predicted_label']
+        
+        # Retrieve image from dataset using index
+        img, _, _ = dataset[idx]
+        img = img.permute(1, 2, 0).cpu().numpy()
+        img = (img - img.min()) / (img.max() - img.min())
+        
+        ax = axes[i]
+        ax.imshow(img)
+        ax.axis('off')
+        ax.set_title(f"Uncertainty: {unc:.4f}\nTrue: {true_lbl} | Pred: {pred_lbl}", 
+                     color=("green" if true_lbl==pred_lbl else "red"))
+        
+    plt.tight_layout()
+    plt.show()
+
+
+def analyze_uncertainty(model, val_loader, device):
+    model.eval()
+    uncertainty_records = []
+    
+    print("\n--- Starting Uncertainty Analysis ---")
+    with torch.no_grad():
+        for inputs, labels, indices in val_loader:
+            inputs = inputs.to(device)
+            logits, mu, log_var = model(inputs)
+            
+            # Score = Mean Variance across channels
+            variances = torch.exp(log_var)
+            batch_uncertainty = variances.mean(dim=(1, 2, 3)) 
+            
+            for i in range(len(indices)):
+                uncertainty_records.append({
+                    "index": indices[i].item(),
+                    "uncertainty_score": batch_uncertainty[i].item(),
+                    "true_label": labels[i].item(),
+                    "predicted_label": logits[i].argmax().item()
+                })
+    
+    uncertainty_records.sort(key=lambda x: x["uncertainty_score"], reverse=True)
+    
+    print("\nTop 5 Most Uncertain Images:")
+    print(f"{'Img Index':<10} | {'Uncertainty':<12} | {'True':<5} | {'Pred':<5}")
+    print("-" * 45)
+    for record in uncertainty_records[:5]:
+        print(f"{record['index']:<10} | {record['uncertainty_score']:.4f}       | {record['true_label']:<5} | {record['predicted_label']:<5}")
+
+    return uncertainty_records
+
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    model = MalariaClassificationNet().to(device)
+    
+    # Dataset Setup
+    dataset = SyntheticMalariaDataset(num_samples=500) # Or RealMalariaDataset
+    
+    # --- VISUALIZATION 1: Show Random Samples ---
+    print("Visualizing Data Samples...")
+    visualize_samples(dataset)
+    
+    # Loaders
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
+    # Train
+    model = train_model(model, train_loader, device, num_epochs=50)
+    
+    # Analyze
+    records = analyze_uncertainty(model, val_loader, device)
+    
+    # --- VISUALIZATION 2: Show Uncertain Images ---
+    # We pass the ORIGINAL dataset so we can index into it
+    visualize_top_uncertain(dataset, records)
