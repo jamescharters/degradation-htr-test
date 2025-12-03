@@ -9,6 +9,7 @@ import random
 import os
 from PIL import Image
 from torchvision import transforms
+import copy
 
 # ==========================================
 # 1. NETWORK & ATTENTION MODULES
@@ -939,70 +940,208 @@ def get_l1_norm_indices(model):
     return sorted_indices
 
 
+def get_snr_indices(model, loader, device):
+    model.eval()
+    channel_snrs = torch.zeros(64).to(device)
+    count = 0
+    with torch.no_grad():
+        for inputs, _, _ in loader:
+            inputs = inputs.to(device)
+            # Get Mean (mu) and LogVar from the model
+            _, mu, log_var, _ = model(inputs)
+            
+            # 1. Signal = Mean Absolute Activation
+            signal = torch.abs(mu).mean(dim=[0, 2, 3])
+            
+            # 2. Noise = Standard Deviation
+            noise = torch.exp(0.5 * log_var).mean(dim=[0, 2, 3])
+            
+            # 3. SNR
+            batch_snr = signal / (noise + 1e-9)
+            channel_snrs += batch_snr
+            count += 1
+            
+    avg_snr = channel_snrs / count
+    
+    # Sort Ascending: Smallest SNR = Prune First
+    # (Low Signal OR High Noise gets pruned)
+    sorted_indices = torch.argsort(avg_snr, descending=False)
+    return sorted_indices
+
+
+def profile_channel_snr(model, loader, device):
+    """
+    Calculates Bayesian Signal-to-Noise Ratio (SNR) for each channel.
+    SNR = |Mean| / StandardDeviation
+    """
+    model.eval()
+    channel_snrs = torch.zeros(64).to(device)
+    count = 0
+    
+    with torch.no_grad():
+        for inputs, _, _ in loader:
+            inputs = inputs.to(device)
+            # We need logits, mu, AND log_var
+            _, mu, log_var, _ = model(inputs)
+            
+            # 1. Signal Strength: Mean absolute activation magnitude
+            # Shape: [Batch, 64, 1, 1] -> Average over batch/spatial -> [64]
+            signal = torch.abs(mu).mean(dim=[0, 2, 3])
+            
+            # 2. Noise Level: Standard Deviation (exp(0.5 * log_var))
+            noise = torch.exp(0.5 * log_var).mean(dim=[0, 2, 3])
+            
+            # 3. SNR: Signal / Noise
+            # Add epsilon to prevent division by zero
+            batch_snr = signal / (noise + 1e-9)
+            
+            channel_snrs += batch_snr
+            count += 1
+            
+    avg_snr = channel_snrs / count
+    
+    # SORT ORDER: ASCENDING
+    # We want to prune channels with the LOWEST SNR (Low Signal OR High Noise)
+    sorted_indices = torch.argsort(avg_snr, descending=False)
+    
+    return sorted_indices
+
+
+
+
 if __name__ == "__main__":
+    import copy
+    import random
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     
-    # 1. Data & Train Base Model (Same as before)
-    #dataset = SyntheticHardDataset(num_samples=1000) 
+    # 1. Data Setup
     dataset = RealMalariaDataset('./data/cell_images/')
+
+    total_len = len(dataset)
+    
+    # Define Sizes
+    train_len = int(0.2 * total_len)  # 20% for Learning Weights
+    val_len = int(0.1 * total_len)    # 10% for Profiling Uncertainty (Decision making)
+    test_len = total_len - train_len - val_len # 70% for Final Score (Reporting)
 
     train_size = int(0.2 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    # 3-Way Split
+    train_dataset, val_dataset, test_dataset_full = torch.utils.data.random_split(
+        dataset, [train_len, val_len, test_len], 
+        generator=torch.Generator().manual_seed(42) # Fixed seed for reproducibility
+    )
+    
+    # --- SPEED OPTIMIZATION: Subset the Test Data ---
+    # We only need ~2000 images to get a reliable accuracy score for the graph.
+    # Evaluating on all 19,000 every time is overkill.
+    eval_size = 2000
+    test_subset, _ = torch.utils.data.random_split(
+        test_dataset_full, [eval_size, len(test_dataset_full) - eval_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False) # Use for Profiling
+    test_loader = DataLoader(test_subset, batch_size=32, shuffle=False) # Use for Final Accuracy
     
-    print("--- Training Base Model (training set size: {train_size}) ---")
+    print(f"Data Split -> Train: {train_len}, Val (Profile): {val_len}, Test (Eval): {len(test_subset)}")
+    
+    # 2. Train Base Model
+    print(f"--- Training Base Model (Training Set Size: {train_size}) ---")
     base_model = MalariaClassificationNet().to(device)
-    base_model, _ = train_model(base_model, train_loader, device, num_epochs=15, method='standard')
+    base_model, _ = train_model(base_model, train_loader, device, num_epochs=10, method='standard') # usually converges around epoch 10 on real malaria dataset
     
-    # 2. The Sweep
-    ratios = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    # 3. Calculate Rankings (The 3 Contenders)
+    # We use Val to decide WHAT to prune
+    print("\n--- Profiling Channels (on Validation Set) ---")
     
-    print(f"\n{'Ratio':<10} | {'Ours (Acc)':<12} | {'Random (Acc)':<12}")
-    print("-" * 40)
+    # A. Bayes-SNR Ranking (Low SNR = Prune First)
+    # This is the new "Gold Standard" hypothesis
+    indices_snr = profile_channel_snr(base_model, val_loader, device)
     
-    # Profile Uncertainty (Sort Descending = Prune High Uncertainty)
-    sorted_indices_unc, _ = profile_channel_uncertainty(base_model, val_loader, device)
+    # B. Raw Uncertainty Ranking (High Variance = Prune First)
+    # This is "Ours (Original)" - note we need the indices only
+    indices_unc, _ = profile_channel_uncertainty(base_model, val_loader, device)
+    
+    # C. L1-Norm Ranking (Small Weights = Prune First)
+    indices_l1 = get_l1_norm_indices(base_model)
+    
+    # 4. Run The Sweep
+    ratios = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 
+              0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.96, 0.97, 0.98, 0.99]
+    
+    print(f"\n{'Ratio':<10} | {'SNR':<10} | {'Raw-Unc':<10} | {'L1-Norm':<10} | {'Random':<10}")
+    print("-" * 65)
     
     for ratio in ratios:
-        # A. OUR METHOD
-        import copy
-        model_unc = copy.deepcopy(base_model)
-        # Prune top N% uncertain
-        indices_unc = sorted_indices_unc[:int(64 * ratio)]
-        model_unc = prune_model(model_unc, indices_unc, ratio)
+        num_pruned = int(64 * ratio)
         
-        # Eval Ours
-        correct = 0
-        total = 0
+        # --- METHOD 1: BAYESIAN SNR ---
+        model_snr = copy.deepcopy(base_model)
+        idx = indices_snr[:num_pruned]
+        model_snr = prune_model(model_snr, idx, ratio)
+        
+        correct = 0; total = 0
+        model_snr.eval()
+        with torch.no_grad():
+            for inputs, labels, _ in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                logits, _, _, _ = model_snr(inputs)
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        acc_snr = 100 * correct / total
+
+        # --- METHOD 2: RAW UNCERTAINTY (High Variance) ---
+        model_unc = copy.deepcopy(base_model)
+        idx = indices_unc[:num_pruned]
+        model_unc = prune_model(model_unc, idx, ratio)
+        
+        correct = 0; total = 0
         model_unc.eval()
         with torch.no_grad():
-            for inputs, labels, _ in val_loader:
+            for inputs, labels, _ in test_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 logits, _, _, _ = model_unc(inputs)
                 _, predicted = torch.max(logits.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-        acc_ours = 100 * correct / total
+        acc_unc = 100 * correct / total
+
+        # --- METHOD 3: L1-NORM (Magnitude) ---
+        model_l1 = copy.deepcopy(base_model)
+        idx = indices_l1[:num_pruned]
+        model_l1 = prune_model(model_l1, idx, ratio)
         
-        # B. RANDOM CONTROL
-        # Average of 3 random runs to be scientifically rigorous
+        correct = 0; total = 0
+        model_l1.eval()
+        with torch.no_grad():
+            for inputs, labels, _ in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                logits, _, _, _ = model_l1(inputs)
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        acc_l1 = 100 * correct / total
+        
+        # --- METHOD 4: RANDOM CONTROL (Avg of 3) ---
         rand_accs = []
         for _ in range(3): 
             model_rand = copy.deepcopy(base_model)
             all_indices = list(range(64))
-            indices_rand = random.sample(all_indices, int(64 * ratio))
-            indices_rand = torch.tensor(indices_rand).to(device)
+            idx = random.sample(all_indices, num_pruned)
+            idx = torch.tensor(idx).to(device)
             
-            model_rand = prune_model(model_rand, indices_rand, ratio)
+            model_rand = prune_model(model_rand, idx, ratio)
             
-            # Eval Random
-            r_correct = 0
-            r_total = 0
+            r_correct = 0; r_total = 0
             model_rand.eval()
             with torch.no_grad():
-                for inputs, labels, _ in val_loader:
+                for inputs, labels, _ in test_loader:
                     inputs, labels = inputs.to(device), labels.to(device)
                     logits, _, _, _ = model_rand(inputs)
                     _, predicted = torch.max(logits.data, 1)
@@ -1010,6 +1149,7 @@ if __name__ == "__main__":
                     r_correct += (predicted == labels).sum().item()
             rand_accs.append(100 * r_correct / r_total)
         
-        acc_rand_mean = sum(rand_accs) / len(rand_accs)
+        acc_rand = sum(rand_accs) / len(rand_accs)
         
-        print(f"{ratio*100:<10.0f}% | {acc_ours:<12.2f} | {acc_rand_mean:<12.2f}")
+        # Print Row
+        print(f"{ratio*100:<10.0f}% | {acc_snr:<10.2f} | {acc_unc:<10.2f} | {acc_l1:<10.2f} | {acc_rand:<10.2f}")
