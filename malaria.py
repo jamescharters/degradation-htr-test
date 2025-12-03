@@ -6,6 +6,9 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import os
+from PIL import Image
+from torchvision import transforms
 
 # ==========================================
 # 1. NETWORK & ATTENTION MODULES
@@ -468,6 +471,55 @@ class SyntheticHardDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx], self.targets[idx], idx
 
+
+
+class RealMalariaDataset(Dataset):
+    def __init__(self, root_dir, mode='train'):
+        self.root_dir = root_dir
+        self.image_paths = []
+        self.labels = []
+        
+        # Check folders
+        parasite_dir = os.path.join(root_dir, 'Parasitized')
+        uninfected_dir = os.path.join(root_dir, 'Uninfected')
+        
+        # Load Parasites (Label 1)
+        print("Loading Parasitized images...")
+        for fname in os.listdir(parasite_dir):
+            if fname.endswith('.png') or fname.endswith('.jpg'):
+                self.image_paths.append(os.path.join(parasite_dir, fname))
+                self.labels.append(1)
+                
+        # Load Uninfected (Label 0)
+        print("Loading Uninfected images...")
+        for fname in os.listdir(uninfected_dir):
+            if fname.endswith('.png') or fname.endswith('.jpg'):
+                self.image_paths.append(os.path.join(uninfected_dir, fname))
+                self.labels.append(0)
+        
+        print(f"Total Images: {len(self.image_paths)}")
+
+        # Transforms: Resize to 44x44 (Paper standard) + Normalize
+        self.transform = transforms.Compose([
+            transforms.Resize((44, 44)),
+            transforms.ToTensor(),
+            # Normalization helps real data significantly
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        image = Image.open(img_path).convert('RGB')
+        image = self.transform(image)
+        # Return index for tracking
+        return image, label, idx
+
+
+
 # ==========================================
 # 3. TRAINING & ANALYSIS
 # ==========================================
@@ -744,7 +796,7 @@ def prune_model(model, sorted_indices, prune_percent=0.5):
     # Get the indices of the "Bad" channels (Highest Uncertainty)
     indices_to_prune = sorted_indices[:num_to_prune]
     
-    print(f"Pruning {num_to_prune} channels (Top {prune_percent*100}% most uncertain)...")
+    #print(f"Pruning {num_to_prune} channels (Top {prune_percent*100}% most uncertain)...")
     
     # CORRECTED INDICES FOR BLOCK 3
     # 0: Conv, 1: BN, 2: ReLU
@@ -773,7 +825,7 @@ def prune_model(model, sorted_indices, prune_percent=0.5):
             # This ensures the uncertainty module 'knows' this channel is dead
             model.bca.fc_shared[0].weight.data[:, idx, :, :] = 0.0
             
-    print("Pruning complete. Weights zeroed for Conv, BN, and Attention.")
+    #print("Pruning complete. Weights zeroed for Conv, BN, and Attention.")
     return model
 
 
@@ -869,28 +921,48 @@ def run_comparative_pruning(model, val_loader, device, prune_percent=0.5):
 #     analyze_uncertainty(model_curriculum, val_loader, device)
 
 
+def get_l1_norm_indices(model):
+    """
+    Standard Pruning Baseline: Rank channels by the sum of their weights.
+    Small weights = Prune.
+    """
+    # Target the same Conv layer: model.block3[6]
+    conv_layer = model.block3[6]
+    
+    # Calculate L1 Norm for each filter (output channel)
+    # Shape: [64, In, H, W] -> sum dimensions (1,2,3) -> [64]
+    l1_norms = torch.sum(torch.abs(conv_layer.weight.data), dim=(1, 2, 3))
+    
+    # Sort: Smallest L1 Norm first (These are considered "unimportant")
+    sorted_indices = torch.argsort(l1_norms, descending=False)
+    
+    return sorted_indices
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     
     # 1. Data & Train Base Model (Same as before)
-    dataset = SyntheticHardDataset(num_samples=1000) 
-    train_size = int(0.8 * len(dataset))
+    #dataset = SyntheticHardDataset(num_samples=1000) 
+    dataset = RealMalariaDataset('./data/cell_images/')
+
+    train_size = int(0.2 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     
-    print("--- Training Base Model ---")
+    print("--- Training Base Model (training set size: {train_size}) ---")
     base_model = MalariaClassificationNet().to(device)
     base_model, _ = train_model(base_model, train_loader, device, num_epochs=15, method='standard')
     
     # 2. The Sweep
-    ratios = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    ratios = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
     
     print(f"\n{'Ratio':<10} | {'Ours (Acc)':<12} | {'Random (Acc)':<12}")
     print("-" * 40)
     
-    # Get uncertainty profile ONCE
+    # Profile Uncertainty (Sort Descending = Prune High Uncertainty)
     sorted_indices_unc, _ = profile_channel_uncertainty(base_model, val_loader, device)
     
     for ratio in ratios:
