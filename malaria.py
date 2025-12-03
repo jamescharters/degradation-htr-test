@@ -227,11 +227,63 @@ class MalariaClassificationNet(nn.Module):
         # Return logits, uncertainty params, AND the attention map
         return logits, mu, log_var, att_map
 
+
+
+# reference implementation of ELBO loss.
 def elbo_loss(logits, targets, mu, log_var, kl_weight=0.0001):
     ce_loss = F.cross_entropy(logits, targets)
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
     kl_loss = kl_loss / logits.size(0)
     return ce_loss + (kl_weight * kl_loss)
+
+# Our "weighted" elbo.
+
+def curriculum_elbo_loss(logits, targets, mu, log_var, current_epoch, max_epochs, kl_weight=0.0001):
+    """
+    NOVELTY: Dynamic Uncertainty-Weighted Loss.
+    
+    Logic:
+    1. Calculate individual loss for every image in the batch.
+    2. Calculate uncertainty (variance) for every image.
+    3. Generate 'Reliability Weights': High Uncertainty -> Low Weight.
+    4. Anneal: Start with strict weighting, slowly fade to standard uniform weighting.
+    """
+    # 1. Standard Losses (reduction='none' keeps the loss individual per image)
+    ce_loss = F.cross_entropy(logits, targets, reduction='none')
+    
+    # KL Divergence per image
+    # Sum over channel dimensions [1,2,3] to get one scalar per image
+    kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[1, 2, 3])
+    
+    # Total raw loss per image
+    raw_loss = ce_loss + (kl_weight * kl_div)
+    
+    # 2. Calculate Uncertainty Score per image
+    # We use the mean variance across channels as the uncertainty proxy
+    # Shape: [Batch_Size]
+    variance = torch.exp(log_var).mean(dim=[1, 2, 3])
+    
+    # 3. Calculate Annealing Factor (Lambda)
+    # Starts at 1.0 (Strict Curriculum), drops linearly to 0.0 (Standard Training)
+    # We stop the curriculum halfway through (e.g., epoch 25 of 50) to let it converge normally
+    lambda_factor = max(0, 1.0 - (current_epoch / (max_epochs * 0.5)))
+    
+    # 4. Calculate Dynamic Weights
+    # weight = (1 / variance)^lambda
+    # If variance is high, weight is low.
+    # We detach() variance because we don't want to backpropagate through the weighting mechanism itself
+    inverse_uncertainty = 1.0 / (variance.detach() + 1e-6) # Add epsilon for stability
+    dynamic_weights = torch.pow(inverse_uncertainty, lambda_factor)
+    
+    # Normalize weights so they sum to Batch Size (maintains loss scale)
+    dynamic_weights = dynamic_weights / dynamic_weights.mean()
+    
+    # 5. Apply Weights
+    weighted_loss = (raw_loss * dynamic_weights).mean()
+    
+    return weighted_loss
+
+
 
 # ==========================================
 # 2. DATASET (Synthetic for Testing)
@@ -268,8 +320,94 @@ def elbo_loss(logits, targets, mu, log_var, kl_weight=0.0001):
 #     def __getitem__(self, idx):
 #         return self.data[idx], self.targets[idx], idx
 
-class SyntheticMalariaDataset(Dataset):
-    def __init__(self, num_samples=500):
+# class SyntheticMalariaDataset(Dataset):
+#     def __init__(self, num_samples=500):
+#         self.num_samples = num_samples
+#         self.data = []
+#         self.targets = []
+#         self.size = 44
+        
+#         # Pre-compute Circular Mask
+#         Y, X = torch.meshgrid(torch.arange(self.size), torch.arange(self.size))
+#         center = self.size / 2 - 0.5
+#         dist_from_center = torch.sqrt((X - center)**2 + (Y - center)**2)
+#         self.mask = (dist_from_center <= 22).float().unsqueeze(0)
+
+#         for _ in range(num_samples):
+#             # 1. BASE TEXTURE (Cloudy Pink)
+#             cloud_noise = torch.randn(1, 3, 11, 11)
+#             cloud_noise = F.interpolate(cloud_noise, size=(self.size, self.size), mode='bilinear', align_corners=False)
+#             cloud_noise = cloud_noise.squeeze(0)
+            
+#             # Base color: Light Purple
+#             base_color = torch.tensor([0.8, 0.6, 0.8]).view(3, 1, 1)
+#             img = base_color + (0.1 * cloud_noise)
+            
+#             label = np.random.randint(0, 2)
+            
+#             Y_grid, X_grid = torch.meshgrid(torch.arange(self.size), torch.arange(self.size))
+
+#             if label == 1:
+#                 # === PARASITE GENERATION ===
+#                 # Logic: Small, Sharp, Dark, Variable Size
+                
+#                 cx = np.random.randint(14, 30)
+#                 cy = np.random.randint(14, 30)
+                
+#                 # Randomize Size (Sigma) - matches paper variability
+#                 sigma_x = np.random.uniform(1.5, 4.0) 
+#                 sigma_y = np.random.uniform(1.5, 4.0) # Different sigmas = Oval shape
+                
+#                 # Calculate Gaussian Blob
+#                 # exponent = - ((x-cx)^2 / 2sx^2 + (y-cy)^2 / 2sy^2)
+#                 exponent = -(((X_grid - cx)**2) / (2 * sigma_x**2) + ((Y_grid - cy)**2) / (2 * sigma_y**2))
+#                 spot = torch.exp(exponent)
+                
+#                 # Randomize Intensity (how much stain it absorbed)
+#                 intensity = np.random.uniform(0.4, 0.8)
+                
+#                 # Subtract color (Dark Purple = remove Green/Red/Blue)
+#                 img[0] -= (intensity * 0.6) * spot # Red
+#                 img[1] -= (intensity * 0.9) * spot # Green (Main component of purple darkness)
+#                 img[2] -= (intensity * 0.6) * spot # Blue
+                
+#             else:
+#                 # === NON-PARASITE ===
+#                 # Logic: Large, Faint, Diffuse (Artifacts)
+                
+#                 # 50% chance to have a "distractor" blob (WBC or stain artifact)
+#                 if np.random.rand() > 0.5:
+#                     cx = np.random.randint(10, 34)
+#                     cy = np.random.randint(10, 34)
+                    
+#                     # Much larger size
+#                     sigma = np.random.uniform(5.0, 10.0)
+                    
+#                     dist_sq = (X_grid - cx)**2 + (Y_grid - cy)**2
+#                     blob = torch.exp(-0.5 * dist_sq / (sigma**2))
+                    
+#                     # Very faint intensity
+#                     img -= 0.15 * blob
+
+#             # Apply Mask & Clamp
+#             img = img * self.mask
+#             img = torch.clamp(img, 0, 1)
+            
+#             self.data.append(img)
+#             self.targets.append(label)
+
+#         self.data = torch.stack(self.data)
+#         self.targets = torch.tensor(self.targets)
+
+#     def __len__(self):
+#         return self.num_samples
+
+#     def __getitem__(self, idx):
+#         return self.data[idx], self.targets[idx], idx
+
+
+class SyntheticHardDataset(Dataset):
+    def __init__(self, num_samples=1000):
         self.num_samples = num_samples
         self.data = []
         self.targets = []
@@ -282,64 +420,41 @@ class SyntheticMalariaDataset(Dataset):
         self.mask = (dist_from_center <= 22).float().unsqueeze(0)
 
         for _ in range(num_samples):
-            # 1. BASE TEXTURE (Cloudy Pink)
-            cloud_noise = torch.randn(1, 3, 11, 11)
-            cloud_noise = F.interpolate(cloud_noise, size=(self.size, self.size), mode='bilinear', align_corners=False)
-            cloud_noise = cloud_noise.squeeze(0)
-            
-            # Base color: Light Purple
-            base_color = torch.tensor([0.8, 0.6, 0.8]).view(3, 1, 1)
-            img = base_color + (0.1 * cloud_noise)
-            
+            # Base Noise
+            img = torch.randn(3, 44, 44) * 0.5 # Reduced base noise slightly
             label = np.random.randint(0, 2)
             
-            Y_grid, X_grid = torch.meshgrid(torch.arange(self.size), torch.arange(self.size))
+            # Helper to draw blob
+            def draw_blob(img, intensity_r, intensity_g, intensity_b, sigma=3.0):
+                cx = np.random.randint(15, 29)
+                cy = np.random.randint(15, 29)
+                Y_grid, X_grid = torch.meshgrid(torch.arange(44), torch.arange(44))
+                dist_sq = (X_grid - cx)**2 + (Y_grid - cy)**2
+                blob = torch.exp(-0.5 * dist_sq / (sigma**2))
+                img[0] += intensity_r * blob
+                img[1] += intensity_g * blob
+                img[2] += intensity_b * blob
+                return img
 
             if label == 1:
-                # === PARASITE GENERATION ===
-                # Logic: Small, Sharp, Dark, Variable Size
-                
-                cx = np.random.randint(14, 30)
-                cy = np.random.randint(14, 30)
-                
-                # Randomize Size (Sigma) - matches paper variability
-                sigma_x = np.random.uniform(1.5, 4.0) 
-                sigma_y = np.random.uniform(1.5, 4.0) # Different sigmas = Oval shape
-                
-                # Calculate Gaussian Blob
-                # exponent = - ((x-cx)^2 / 2sx^2 + (y-cy)^2 / 2sy^2)
-                exponent = -(((X_grid - cx)**2) / (2 * sigma_x**2) + ((Y_grid - cy)**2) / (2 * sigma_y**2))
-                spot = torch.exp(exponent)
-                
-                # Randomize Intensity (how much stain it absorbed)
-                intensity = np.random.uniform(0.4, 0.8)
-                
-                # Subtract color (Dark Purple = remove Green/Red/Blue)
-                img[0] -= (intensity * 0.6) * spot # Red
-                img[1] -= (intensity * 0.9) * spot # Green (Main component of purple darkness)
-                img[2] -= (intensity * 0.6) * spot # Blue
+                # TRUE PARASITE: Purple Blob (High Red, High Blue, Low Green)
+                # This is the signal we want to learn.
+                img = draw_blob(img, 3.0, -1.0, 3.0) 
                 
             else:
-                # === NON-PARASITE ===
-                # Logic: Large, Faint, Diffuse (Artifacts)
-                
-                # 50% chance to have a "distractor" blob (WBC or stain artifact)
+                # 50% chance of "Hard Negative" (Artifact)
                 if np.random.rand() > 0.5:
-                    cx = np.random.randint(10, 34)
-                    cy = np.random.randint(10, 34)
-                    
-                    # Much larger size
-                    sigma = np.random.uniform(5.0, 10.0)
-                    
-                    dist_sq = (X_grid - cx)**2 + (Y_grid - cy)**2
-                    blob = torch.exp(-0.5 * dist_sq / (sigma**2))
-                    
-                    # Very faint intensity
-                    img -= 0.15 * blob
+                    # ARTIFACT: Red/Pink Blob (High Red, Normal Green, Low Blue)
+                    # Looks similar to parasite but wrong color balance.
+                    # Standard model will confuse this with Label 1.
+                    img = draw_blob(img, 3.0, 0.5, 0.5) 
+                else:
+                    # Easy Negative (Empty)
+                    pass
 
             # Apply Mask & Clamp
             img = img * self.mask
-            img = torch.clamp(img, 0, 1)
+            img = torch.clamp(img, -3, 3) # Keep within reasonable bounds
             
             self.data.append(img)
             self.targets.append(label)
@@ -356,30 +471,44 @@ class SyntheticMalariaDataset(Dataset):
 # ==========================================
 # 3. TRAINING & ANALYSIS
 # ==========================================
-def train_model(model, train_loader, device, num_epochs=50):
-    # Switch to Adam for faster convergence on toy problems
+def train_model(model, train_loader, device, num_epochs=10, method='standard'):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     kl_weight = 0.0
     
-    print(f"Starting training on {device}...")
+    print(f"Starting training with method: {method.upper()}")
     model.train()
+    
+    # Store history for plotting later
+    loss_history = []
     
     for epoch in range(num_epochs):
         running_loss = 0.0
         correct = 0
         total = 0
         
-        # Increase KL weight slowly
+        # Anneal KL weight (Standard Bayesian Practice)
         kl_weight = min(0.01, kl_weight + 0.002) 
 
         for inputs, labels, _ in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
+            
+            # Unpack 4 values (ignoring attention map)
             logits, mu, log_var, _ = model(inputs)
             
-            # Loss
-            loss = elbo_loss(logits, labels, mu, log_var, kl_weight=kl_weight)
+            # --- SWITCH: Standard vs Curriculum ---
+            if method == 'curriculum':
+                loss = curriculum_elbo_loss(
+                    logits, labels, mu, log_var, 
+                    current_epoch=epoch, 
+                    max_epochs=num_epochs, 
+                    kl_weight=kl_weight
+                )
+            else:
+                # Standard: Just average the loss normally
+                loss = elbo_loss(logits, labels, mu, log_var, kl_weight=kl_weight)
+            # --------------------------------------
             
             loss.backward()
             optimizer.step()
@@ -391,9 +520,11 @@ def train_model(model, train_loader, device, num_epochs=50):
             
         avg_loss = running_loss / len(train_loader)
         acc = 100 * correct / total
-        print(f"Epoch [{epoch+1}/{num_epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+        loss_history.append(avg_loss)
         
-    return model
+        print(f"Epoch [{epoch+1}/{num_epochs}] Method: {method} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+        
+    return model, loss_history
 
 
 # 
@@ -566,16 +697,13 @@ def visualize_attention_maps(model, dataset, num_samples=5, device="cpu"):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
-    model = MalariaClassificationNet().to(device)
     
-    # Dataset Setup
-    dataset = SyntheticMalariaDataset(num_samples=500) # Or RealMalariaDataset
+    # 1. Setup Data
+    # Use Synthetic for now, swap to RealMalariaDataset for the thesis
+    #dataset = SyntheticMalariaDataset(num_samples=1000) 
+    dataset = SyntheticHardDataset(num_samples=1000) 
     
-    # --- VISUALIZATION 1: Show Random Samples ---
-    print("Visualizing Data Samples...")
-    visualize_samples(dataset)
-    
-    # Loaders
+    # Split
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
@@ -583,15 +711,26 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     
-    # Train
-    model = train_model(model, train_loader, device, num_epochs=50)
+    # --- EXPERIMENT 1: BASELINE (Xiong et al.) ---
+    print("\n=== Running Baseline Experiment ===")
+    model_standard = MalariaClassificationNet().to(device)
+    model_standard, history_standard = train_model(model_standard, train_loader, device, num_epochs=10, method='standard')
     
-    # Analyze
-    records = analyze_uncertainty(model, val_loader, device)
-    
-    # --- VISUALIZATION 2: Show Uncertain Images ---
-    # We pass the ORIGINAL dataset so we can index into it
-    visualize_top_uncertain(dataset, records)
+    # --- EXPERIMENT 2: YOUR CONTRIBUTION ---
+    print("\n=== Running Curriculum Experiment (Ours) ===")
+    model_curriculum = MalariaClassificationNet().to(device)
+    model_curriculum, history_curriculum = train_model(model_curriculum, train_loader, device, num_epochs=10, method='curriculum')
 
-    # --- VISUALIZATION 3: Explainability ---
-    visualize_attention_maps(model, dataset, num_samples=4, device=device)
+    # --- PLOT COMPARISON ---
+    plt.figure(figsize=(10, 5))
+    plt.plot(history_standard, label='Standard (Baseline)', linestyle='--')
+    plt.plot(history_curriculum, label='Uncertainty Curriculum (Ours)', linewidth=2)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training Convergence: Baseline vs. Proposed Curriculum')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    # Analyze Final Uncertainty on the Curriculum Model
+    analyze_uncertainty(model_curriculum, val_loader, device)
