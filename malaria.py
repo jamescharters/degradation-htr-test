@@ -695,42 +695,177 @@ def visualize_attention_maps(model, dataset, num_samples=5, device="cpu"):
     plt.show()
 
 
+
+
+
+def profile_channel_uncertainty(model, loader, device):
+    """
+    Step 2: Pass data through and find which channels are 'noisy'.
+    Returns: A list of (channel_index, average_uncertainty) sorted from High to Low.
+    """
+    model.eval()
+    
+    # Store accumulated variance for each of the 64 channels
+    channel_uncertainties = torch.zeros(64).to(device)
+    count = 0
+    
+    with torch.no_grad():
+        for inputs, _, _ in loader:
+            inputs = inputs.to(device)
+            # We only care about log_var here
+            _, _, log_var, _ = model(inputs)
+            
+            # log_var shape: [Batch, 64, 1, 1]
+            # Convert to variance: exp(log_var)
+            # Average over Batch (dim 0) -> Shape: [64, 1, 1]
+            batch_vars = torch.exp(log_var).mean(dim=0).view(-1)
+            
+            channel_uncertainties += batch_vars
+            count += 1
+            
+    # Average over all batches
+    avg_uncertainties = channel_uncertainties / count
+    
+    # Sort: High Uncertainty first
+    # argsort gives the indices
+    sorted_indices = torch.argsort(avg_uncertainties, descending=True)
+    
+    return sorted_indices, avg_uncertainties
+
+def prune_model(model, sorted_indices, prune_percent=0.5):
+    """
+    Step 3: 'Delete' the bad channels.
+    We simulate deletion by setting weights to 0.
+    """
+    # Calculate how many to cut
+    num_channels = 64
+    num_to_prune = int(num_channels * prune_percent)
+    
+    # Get the indices of the "Bad" channels (Highest Uncertainty)
+    indices_to_prune = sorted_indices[:num_to_prune]
+    
+    print(f"Pruning {num_to_prune} channels (Top {prune_percent*100}% most uncertain)...")
+    
+    # CORRECTED INDICES FOR BLOCK 3
+    # 0: Conv, 1: BN, 2: ReLU
+    # 3: Conv, 4: BN, 5: ReLU
+    # 6: Conv (TARGET), 7: BN (TARGET), 8: ReLU, 9: MaxPool
+    
+    conv_layer = model.block3[6]  # The last Conv2d
+    bn_layer = model.block3[7]    # The last BatchNorm
+    
+    with torch.no_grad():
+        # 1. Zero out the CONVOLUTION filters
+        for idx in indices_to_prune:
+            # Conv weights are [Out, In, H, W]. We prune the Output filters.
+            conv_layer.weight.data[idx, :, :, :] = 0.0
+            if conv_layer.bias is not None:
+                conv_layer.bias.data[idx] = 0.0
+                
+            # 2. Zero out the BATCH NORM stats
+            # If we don't do this, BN might add a 'bias' term even if the input is 0
+            bn_layer.weight.data[idx] = 0.0
+            bn_layer.bias.data[idx] = 0.0
+            bn_layer.running_mean[idx] = 0.0
+            bn_layer.running_var[idx] = 1.0 # Set var to 1 to avoid div by zero
+            
+            # 3. Zero out the BAYESIAN ATTENTION Input connections
+            # This ensures the uncertainty module 'knows' this channel is dead
+            model.bca.fc_shared[0].weight.data[:, idx, :, :] = 0.0
+            
+    print("Pruning complete. Weights zeroed for Conv, BN, and Attention.")
+    return model
+
+
+
+
+
+
+
+
+
+# if __name__ == "__main__":
+#     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    
+#     # 1. Setup Data
+#     # Use Synthetic for now, swap to RealMalariaDataset for the thesis
+#     #dataset = SyntheticMalariaDataset(num_samples=1000) 
+#     dataset = SyntheticHardDataset(num_samples=1000) 
+    
+#     # Split
+#     train_size = int(0.8 * len(dataset))
+#     val_size = len(dataset) - train_size
+#     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+#     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+#     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
+#     # --- EXPERIMENT 1: BASELINE (Xiong et al.) ---
+#     print("\n=== Running Baseline Experiment ===")
+#     model_standard = MalariaClassificationNet().to(device)
+#     model_standard, history_standard = train_model(model_standard, train_loader, device, num_epochs=10, method='standard')
+    
+#     # --- EXPERIMENT 2: YOUR CONTRIBUTION ---
+#     print("\n=== Running Curriculum Experiment (Ours) ===")
+#     model_curriculum = MalariaClassificationNet().to(device)
+#     model_curriculum, history_curriculum = train_model(model_curriculum, train_loader, device, num_epochs=10, method='curriculum')
+
+#     # --- PLOT COMPARISON ---
+#     plt.figure(figsize=(10, 5))
+#     plt.plot(history_standard, label='Standard (Baseline)', linestyle='--')
+#     plt.plot(history_curriculum, label='Uncertainty Curriculum (Ours)', linewidth=2)
+#     plt.xlabel('Epochs')
+#     plt.ylabel('Loss')
+#     plt.title('Training Convergence: Baseline vs. Proposed Curriculum')
+#     plt.legend()
+#     plt.grid(True)
+#     plt.show()
+    
+#     # Analyze Final Uncertainty on the Curriculum Model
+#     analyze_uncertainty(model_curriculum, val_loader, device)
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     
-    # 1. Setup Data
-    # Use Synthetic for now, swap to RealMalariaDataset for the thesis
-    #dataset = SyntheticMalariaDataset(num_samples=1000) 
+    # 1. Setup Hard Data
     dataset = SyntheticHardDataset(num_samples=1000) 
-    
-    # Split
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     
-    # --- EXPERIMENT 1: BASELINE (Xiong et al.) ---
-    print("\n=== Running Baseline Experiment ===")
-    model_standard = MalariaClassificationNet().to(device)
-    model_standard, history_standard = train_model(model_standard, train_loader, device, num_epochs=10, method='standard')
+    # 2. Train Full Model
+    print("--- Phase 1: Training Full Model ---")
+    model = MalariaClassificationNet().to(device)
+    model, _ = train_model(model, train_loader, device, num_epochs=15, method='standard')
     
-    # --- EXPERIMENT 2: YOUR CONTRIBUTION ---
-    print("\n=== Running Curriculum Experiment (Ours) ===")
-    model_curriculum = MalariaClassificationNet().to(device)
-    model_curriculum, history_curriculum = train_model(model_curriculum, train_loader, device, num_epochs=10, method='curriculum')
-
-    # --- PLOT COMPARISON ---
-    plt.figure(figsize=(10, 5))
-    plt.plot(history_standard, label='Standard (Baseline)', linestyle='--')
-    plt.plot(history_curriculum, label='Uncertainty Curriculum (Ours)', linewidth=2)
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training Convergence: Baseline vs. Proposed Curriculum')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # 3. Analyze Uncertainty Profile
+    print("\n--- Phase 2: Profiling Channels ---")
+    sorted_indices, avg_unc = profile_channel_uncertainty(model, val_loader, device)
     
-    # Analyze Final Uncertainty on the Curriculum Model
-    analyze_uncertainty(model_curriculum, val_loader, device)
+    print("Most Uncertain Channel:", sorted_indices[0].item(), "Val:", avg_unc[sorted_indices[0]].item())
+    print("Most Reliable Channel:", sorted_indices[-1].item(), "Val:", avg_unc[sorted_indices[-1]].item())
+    
+    # 4. Prune 50% of the network!
+    model = prune_model(model, sorted_indices, prune_percent=0.5)
+    
+    # 5. Evaluate (Should drop slightly)
+    print("\n--- Phase 3: Zero-Shot Evaluation (After Pruning) ---")
+    # A quick val loop here...
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels, _ in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            logits, _, _, _ = model(inputs)
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    print(f"Accuracy after pruning (No Fine-Tuning): {100 * correct / total:.2f}%")
+    
+    # 6. Fine-Tune (Recover Accuracy)
+    print("\n--- Phase 4: Fine-Tuning ---")
+    # Train for 5 more epochs to let the remaining 50% channels adapt
+    model, _ = train_model(model, train_loader, device, num_epochs=5, method='standard')
