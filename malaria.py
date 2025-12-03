@@ -43,32 +43,125 @@ class BayesianChannelAttention(nn.Module):
         
         return out_features, variance, mu, log_var
 
+# class UncertaintyGuidedPixelAttention(nn.Module):
+#     def __init__(self, in_channels, beta=10):
+#         super(UncertaintyGuidedPixelAttention, self).__init__()
+#         self.beta = beta
+#         self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.conv2 = nn.Conv2d(in_channels // 2, 1, kernel_size=1)
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x, variance):
+#         w_sigma = torch.exp(-self.beta * variance)
+#         features_tilde = x * w_sigma
+        
+#         pa = self.conv1(features_tilde)
+#         pa = self.relu(pa)
+#         pa = self.conv2(pa)
+#         att_map = self.sigmoid(pa)
+        
+#         output = features_tilde + (features_tilde * att_map)
+#         return output
+
 class UncertaintyGuidedPixelAttention(nn.Module):
+    """
+    Implements Section 3.6: Uncertainty-Guided Pixel Attention.
+    Uses variance from BCA to filter features before spatial attention.
+    Now returns the attention map for visualization.
+    """
     def __init__(self, in_channels, beta=10):
         super(UncertaintyGuidedPixelAttention, self).__init__()
         self.beta = beta
+        
+        # Standard Pixel Attention layers (Conv 1x1 based)
         self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(in_channels // 2, 1, kernel_size=1)
+        self.conv2 = nn.Conv2d(in_channels // 2, 1, kernel_size=1) # Output 1 spatial map
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, variance):
+        # 1. Calculate Reliability Weights (Eq 13)
+        # w_sigma = exp(-beta * sigma^2)
         w_sigma = torch.exp(-self.beta * variance)
+        
+        # 2. Filter unreliable channels (Eq 15 - first part)
+        # Features with high variance get suppressed here
         features_tilde = x * w_sigma
         
+        # 3. Compute Pixel Attention Map on reliable features (Eq 14)
         pa = self.conv1(features_tilde)
         pa = self.relu(pa)
         pa = self.conv2(pa)
-        att_map = self.sigmoid(pa)
+        att_map = self.sigmoid(pa) # Shape: [B, 1, 5, 5]
         
+        # 4. Apply Pixel Attention (Eq 15 - second part)
         output = features_tilde + (features_tilde * att_map)
-        return output
+        
+        # Return both the processed features AND the heatmap
+        return output, att_map
+
+# class MalariaClassificationNet(nn.Module):
+#     def __init__(self, num_classes=2):
+#         super(MalariaClassificationNet, self).__init__()
+        
+#         # Feature Extraction
+#         self.block1 = nn.Sequential(
+#             nn.Conv2d(3, 16, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+#             nn.Conv2d(16, 16, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+#             nn.MaxPool2d(2) 
+#         )
+#         self.block2 = nn.Sequential(
+#             nn.Conv2d(16, 32, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+#             nn.Conv2d(32, 32, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+#             nn.MaxPool2d(2)
+#         )
+#         self.block3 = nn.Sequential(
+#             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+#             nn.Conv2d(64, 64, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+#             nn.Conv2d(64, 64, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+#             nn.MaxPool2d(2)
+#         )
+        
+#         self.bca = BayesianChannelAttention(in_channels=64)
+#         self.ugpa = UncertaintyGuidedPixelAttention(in_channels=64, beta=10)
+        
+#         self.classifier = nn.Sequential(
+#             nn.Linear(64 * 5 * 5, 512),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(p=0.5),
+#             nn.Linear(512, 50),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(p=0.5),
+#             nn.Linear(50, num_classes)
+#         )
+
+#     def forward(self, x):
+#         f1 = self.block1(x)
+#         f2 = self.block2(f1)
+#         features = self.block3(f2)
+        
+#         bca_features, variance, mu, log_var = self.bca(features)
+#         final_features = self.ugpa(bca_features, variance)
+        
+#         flat = final_features.view(final_features.size(0), -1)
+#         logits = self.classifier(flat)
+        
+#         return logits, mu, log_var
 
 class MalariaClassificationNet(nn.Module):
     def __init__(self, num_classes=2):
         super(MalariaClassificationNet, self).__init__()
         
-        # Feature Extraction
+        # --- Feature Extraction (Fig 3) ---
+        # Block 1: 44x44 -> 22x22
         self.block1 = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16), nn.ReLU(inplace=True),
@@ -76,6 +169,8 @@ class MalariaClassificationNet(nn.Module):
             nn.BatchNorm2d(16), nn.ReLU(inplace=True),
             nn.MaxPool2d(2) 
         )
+        
+        # Block 2: 22x22 -> 11x11
         self.block2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -83,6 +178,8 @@ class MalariaClassificationNet(nn.Module):
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
             nn.MaxPool2d(2)
         )
+        
+        # Block 3: 11x11 -> 5x5
         self.block3 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
@@ -93,31 +190,42 @@ class MalariaClassificationNet(nn.Module):
             nn.MaxPool2d(2)
         )
         
+        # --- Attention Mechanisms ---
         self.bca = BayesianChannelAttention(in_channels=64)
         self.ugpa = UncertaintyGuidedPixelAttention(in_channels=64, beta=10)
         
+        # --- Classification Head ---
         self.classifier = nn.Sequential(
             nn.Linear(64 * 5 * 5, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.5),
+            
             nn.Linear(512, 50),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.5),
+            
             nn.Linear(50, num_classes)
         )
 
     def forward(self, x):
+        # 1. Feature Extraction
         f1 = self.block1(x)
         f2 = self.block2(f1)
-        features = self.block3(f2)
+        features = self.block3(f2) # Shape: [B, 64, 5, 5]
         
+        # 2. Bayesian Channel Attention
         bca_features, variance, mu, log_var = self.bca(features)
-        final_features = self.ugpa(bca_features, variance)
         
+        # 3. Uncertainty-Guided Pixel Attention
+        # Now capturing the attention map 'att_map'
+        final_features, att_map = self.ugpa(bca_features, variance)
+        
+        # 4. Classification
         flat = final_features.view(final_features.size(0), -1)
         logits = self.classifier(flat)
         
-        return logits, mu, log_var
+        # Return logits, uncertainty params, AND the attention map
+        return logits, mu, log_var, att_map
 
 def elbo_loss(logits, targets, mu, log_var, kl_weight=0.0001):
     ce_loss = F.cross_entropy(logits, targets)
@@ -268,7 +376,7 @@ def train_model(model, train_loader, device, num_epochs=50):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
-            logits, mu, log_var = model(inputs)
+            logits, mu, log_var, _ = model(inputs)
             
             # Loss
             loss = elbo_loss(logits, labels, mu, log_var, kl_weight=kl_weight)
@@ -379,7 +487,7 @@ def analyze_uncertainty(model, val_loader, device):
     with torch.no_grad():
         for inputs, labels, indices in val_loader:
             inputs = inputs.to(device)
-            logits, mu, log_var = model(inputs)
+            logits, mu, log_var, _ = model(inputs)
             
             # Score = Mean Variance across channels
             variances = torch.exp(log_var)
@@ -403,6 +511,57 @@ def analyze_uncertainty(model, val_loader, device):
 
     return uncertainty_records
 
+
+def visualize_attention_maps(model, dataset, num_samples=5, device="cpu"):
+    """
+    Shows the original image next to the "Brain Scan" (Attention Map)
+    """
+    model.eval()
+    
+    # Get random parasites (Class 1) to see if it finds the dot
+    indices = [i for i, (_, label, _) in enumerate(dataset) if label == 1]
+    selected_indices = random.sample(indices, num_samples)
+    
+    fig, axes = plt.subplots(num_samples, 3, figsize=(10, 3*num_samples))
+    fig.suptitle("Explainability: Where is the model looking?", fontsize=16)
+    
+    with torch.no_grad():
+        for i, idx in enumerate(selected_indices):
+            img_tensor, label, _ = dataset[idx]
+            input_batch = img_tensor.unsqueeze(0).to(device)
+            
+            # Forward pass
+            logits, mu, log_var, att_map = model(input_batch)
+            
+            # 1. Original Image
+            img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+            
+            # 2. Attention Map processing
+            # Resize 5x5 map to 44x44
+            map_tensor = att_map[0, 0] # Take first item in batch, first channel
+            # Upsample using bilinear interpolation
+            map_resized = F.interpolate(att_map, size=(44, 44), mode='bilinear', align_corners=False)
+            map_np = map_resized[0, 0].cpu().numpy()
+            
+            # Plot Original
+            axes[i, 0].imshow(img_np)
+            axes[i, 0].set_title("Original Parasite")
+            axes[i, 0].axis('off')
+            
+            # Plot Heatmap
+            axes[i, 1].imshow(map_np, cmap='jet')
+            axes[i, 1].set_title("Attention Heatmap")
+            axes[i, 1].axis('off')
+            
+            # Plot Overlay
+            axes[i, 2].imshow(img_np)
+            axes[i, 2].imshow(map_np, cmap='jet', alpha=0.5) # Alpha blends them
+            axes[i, 2].set_title("Overlay")
+            axes[i, 2].axis('off')
+            
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
@@ -433,3 +592,6 @@ if __name__ == "__main__":
     # --- VISUALIZATION 2: Show Uncertain Images ---
     # We pass the ORIGINAL dataset so we can index into it
     visualize_top_uncertain(dataset, records)
+
+    # --- VISUALIZATION 3: Explainability ---
+    visualize_attention_maps(model, dataset, num_samples=4, device=device)
