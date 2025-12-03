@@ -778,6 +778,50 @@ def prune_model(model, sorted_indices, prune_percent=0.5):
 
 
 
+def run_comparative_pruning(model, val_loader, device, prune_percent=0.5):
+    """
+    Runs 3 types of pruning and compares the damage.
+    """
+    print(f"\n--- STARTING COMPARATIVE STUDY (Pruning {prune_percent*100}%) ---")
+    
+    # 1. Get True Uncertainty Indices (YOUR METHOD)
+    sorted_indices_unc, _ = profile_channel_uncertainty(model, val_loader, device)
+    indices_unc = sorted_indices_unc[:int(64 * prune_percent)]
+    
+    # 2. Get Random Indices (BASELINE)
+    all_indices = list(range(64))
+    indices_rand = random.sample(all_indices, int(64 * prune_percent))
+    indices_rand = torch.tensor(indices_rand).to(device)
+    
+    # 3. Define Evaluation Helper
+    def evaluate_pruned_copy(indices, name):
+        # Create a deep copy of the model so we don't destroy the original
+        import copy
+        model_copy = copy.deepcopy(model)
+        
+        # Prune
+        model_copy = prune_model(model_copy, indices, prune_percent)
+        
+        # Eval
+        correct = 0
+        total = 0
+        model_copy.eval()
+        with torch.no_grad():
+            for inputs, labels, _ in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                logits, _, _, _ = model_copy(inputs)
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        acc = 100 * correct / total
+        print(f"[{name}] Zero-Shot Accuracy: {acc:.2f}%")
+        return acc
+
+    # --- RUN COMPARISONS ---
+    acc_unc = evaluate_pruned_copy(indices_unc, "PROPOSED (Uncertainty)")
+    acc_rand = evaluate_pruned_copy(indices_rand, "CONTROL (Random)")
+    
+    return acc_unc, acc_rand
 
 
 
@@ -828,7 +872,7 @@ def prune_model(model, sorted_indices, prune_percent=0.5):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     
-    # 1. Setup Hard Data
+    # 1. Data & Train Base Model (Same as before)
     dataset = SyntheticHardDataset(num_samples=1000) 
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -836,36 +880,64 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     
-    # 2. Train Full Model
-    print("--- Phase 1: Training Full Model ---")
-    model = MalariaClassificationNet().to(device)
-    model, _ = train_model(model, train_loader, device, num_epochs=15, method='standard')
+    print("--- Training Base Model ---")
+    base_model = MalariaClassificationNet().to(device)
+    base_model, _ = train_model(base_model, train_loader, device, num_epochs=15, method='standard')
     
-    # 3. Analyze Uncertainty Profile
-    print("\n--- Phase 2: Profiling Channels ---")
-    sorted_indices, avg_unc = profile_channel_uncertainty(model, val_loader, device)
+    # 2. The Sweep
+    ratios = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
     
-    print("Most Uncertain Channel:", sorted_indices[0].item(), "Val:", avg_unc[sorted_indices[0]].item())
-    print("Most Reliable Channel:", sorted_indices[-1].item(), "Val:", avg_unc[sorted_indices[-1]].item())
+    print(f"\n{'Ratio':<10} | {'Ours (Acc)':<12} | {'Random (Acc)':<12}")
+    print("-" * 40)
     
-    # 4. Prune 50% of the network!
-    model = prune_model(model, sorted_indices, prune_percent=0.5)
+    # Get uncertainty profile ONCE
+    sorted_indices_unc, _ = profile_channel_uncertainty(base_model, val_loader, device)
     
-    # 5. Evaluate (Should drop slightly)
-    print("\n--- Phase 3: Zero-Shot Evaluation (After Pruning) ---")
-    # A quick val loop here...
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels, _ in val_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            logits, _, _, _ = model(inputs)
-            _, predicted = torch.max(logits.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    print(f"Accuracy after pruning (No Fine-Tuning): {100 * correct / total:.2f}%")
-    
-    # 6. Fine-Tune (Recover Accuracy)
-    print("\n--- Phase 4: Fine-Tuning ---")
-    # Train for 5 more epochs to let the remaining 50% channels adapt
-    model, _ = train_model(model, train_loader, device, num_epochs=5, method='standard')
+    for ratio in ratios:
+        # A. OUR METHOD
+        import copy
+        model_unc = copy.deepcopy(base_model)
+        # Prune top N% uncertain
+        indices_unc = sorted_indices_unc[:int(64 * ratio)]
+        model_unc = prune_model(model_unc, indices_unc, ratio)
+        
+        # Eval Ours
+        correct = 0
+        total = 0
+        model_unc.eval()
+        with torch.no_grad():
+            for inputs, labels, _ in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                logits, _, _, _ = model_unc(inputs)
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        acc_ours = 100 * correct / total
+        
+        # B. RANDOM CONTROL
+        # Average of 3 random runs to be scientifically rigorous
+        rand_accs = []
+        for _ in range(3): 
+            model_rand = copy.deepcopy(base_model)
+            all_indices = list(range(64))
+            indices_rand = random.sample(all_indices, int(64 * ratio))
+            indices_rand = torch.tensor(indices_rand).to(device)
+            
+            model_rand = prune_model(model_rand, indices_rand, ratio)
+            
+            # Eval Random
+            r_correct = 0
+            r_total = 0
+            model_rand.eval()
+            with torch.no_grad():
+                for inputs, labels, _ in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    logits, _, _, _ = model_rand(inputs)
+                    _, predicted = torch.max(logits.data, 1)
+                    r_total += labels.size(0)
+                    r_correct += (predicted == labels).sum().item()
+            rand_accs.append(100 * r_correct / r_total)
+        
+        acc_rand_mean = sum(rand_accs) / len(rand_accs)
+        
+        print(f"{ratio*100:<10.0f}% | {acc_ours:<12.2f} | {acc_rand_mean:<12.2f}")
